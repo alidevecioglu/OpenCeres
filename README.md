@@ -62,6 +62,14 @@ Apple's command-line tools). Rust is installed only inside
 ./mac build                      # target/macos/release/OpenCeres.app
 ```
 
+## Releases
+
+GitHub Actions builds macOS (universal), Linux and Windows downloads for every
+push. A release is published automatically the first time a new `version` in
+`Cargo.toml` reaches `main`: bump the version, push, and the
+[Releases](https://github.com/alidevecioglu/OpenCeres/releases) page gets
+`v<version>` with all downloads attached.
+
 ## Contributing
 
 Issues and pull requests are welcome. Please run `./dev check` before opening a

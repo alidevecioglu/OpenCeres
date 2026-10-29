@@ -1,5 +1,6 @@
 # Checks every push and pull request, builds the desktop app for macOS,
-# Linux and Windows, and publishes a GitHub Release for version tags (v*).
+# Linux and Windows, and publishes a GitHub Release automatically for each
+# new version in Cargo.toml (see the release job).
 name: Build
 
 on:
@@ -25,12 +26,12 @@ jobs:
     name: Format, lint, test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install Rust
         run: |
           rustup toolchain install "$RUST_VERSION" --profile minimal --component rustfmt,clippy
           rustup default "$RUST_VERSION"
-      - uses: actions/cache@v4
+      - uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
@@ -56,7 +57,7 @@ jobs:
             os: windows-latest
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Version
         id: version
@@ -72,7 +73,7 @@ jobs:
           rustup toolchain install "$RUST_VERSION" --profile minimal
           rustup default "$RUST_VERSION"
 
-      - uses: actions/cache@v4
+      - uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
@@ -116,29 +117,52 @@ jobs:
           Compress-Archive -Path "dist/$name/*" -DestinationPath "dist/$name.zip"
           Remove-Item -Recurse "dist/$name"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: OpenCeres-${{ matrix.name }}
           path: dist/*
           if-no-files-found: error
 
+  # Releases happen automatically: when a push to main builds successfully and
+  # no release exists yet for the version in Cargo.toml, tag v<version> is
+  # created with the builds attached. Bump `version` to publish a new release.
+  # Pushing a v* tag by hand also works.
   release:
     name: Publish release
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
     needs: build
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@v7
+      - name: Decide tag
+        id: tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ "${{ github.ref_type }}" = tag ]; then
+            tag="${{ github.ref_name }}"
+          else
+            tag="v$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)"
+          fi
+          if gh release view "$tag" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            echo "Release $tag already exists; nothing to publish."
+          else
+            echo "name=$tag" >> "$GITHUB_OUTPUT"
+          fi
+      - uses: actions/download-artifact@v8
+        if: steps.tag.outputs.name
         with:
           path: dist
           merge-multiple: true
       - name: Create GitHub release
+        if: steps.tag.outputs.name
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "${{ github.ref_name }}" dist/* \
+          gh release create "${{ steps.tag.outputs.name }}" dist/* \
             --repo "${{ github.repository }}" \
-            --title "OpenCeres ${{ github.ref_name }}" \
+            --target "${{ github.sha }}" \
+            --title "OpenCeres ${{ steps.tag.outputs.name }}" \
             --generate-notes
