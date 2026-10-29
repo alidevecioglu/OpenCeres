@@ -127,6 +127,11 @@ fn lookup(source: KnownSource, field: &Field) -> Result<Lookup, LookupError> {
     })
 }
 
+/// SkyBoT intermittently leaves objects out of a reply (in testing, about
+/// one identical request in six came back with 4 of 6 objects, missing the
+/// unnumbered ones). So every lookup sends the same request twice at once,
+/// as two `curl` processes, and keeps the union of both replies; it fails
+/// only if both requests fail.
 fn skybot(field: &Field) -> Result<Vec<KnownObject>, String> {
     let url = known::skybot_url(
         field.ra,
@@ -135,19 +140,50 @@ fn skybot(field: &Field) -> Result<Vec<KnownObject>, String> {
         field.jd,
         field.observatory.as_deref(),
     );
-    let out = curl()
-        .args(["-sSf", "--max-time", "60", &url])
-        .stdin(Stdio::null())
-        .output()
-        .map_err(|_| NO_CURL.to_owned())?;
-    if !out.status.success() {
-        return Err(OFFLINE.into());
+    let ask = || -> Result<Vec<KnownObject>, String> {
+        let out = curl()
+            .args(["-sSf", "--max-time", "60", &url])
+            .stdin(Stdio::null())
+            .output()
+            .map_err(|_| NO_CURL.to_owned())?;
+        if !out.status.success() {
+            return Err(OFFLINE.into());
+        }
+        known::parse_skybot(&String::from_utf8_lossy(&out.stdout))
+    };
+    let (first, second) = std::thread::scope(|s| {
+        let other = s.spawn(ask);
+        let first = ask();
+        let second = other
+            .join()
+            .unwrap_or_else(|_| Err("The lookup stopped unexpectedly.".into()));
+        (first, second)
+    });
+    merge_replies(first, second)
+}
+
+/// Union of two replies by designation, keeping the first reply's entry
+/// (and order) for objects in both.
+fn merge_replies(
+    first: Result<Vec<KnownObject>, String>,
+    second: Result<Vec<KnownObject>, String>,
+) -> Result<Vec<KnownObject>, String> {
+    match (first, second) {
+        (Ok(mut a), Ok(b)) => {
+            for o in b {
+                if !a.iter().any(|x| x.number == o.number && x.name == o.name) {
+                    a.push(o);
+                }
+            }
+            Ok(a)
+        }
+        (Ok(a), Err(_)) | (Err(_), Ok(a)) => Ok(a),
+        (Err(e), Err(_)) => Err(e),
     }
-    known::parse_skybot(&String::from_utf8_lossy(&out.stdout))
 }
 
 /// `curl` without a console window popping up on Windows.
-fn curl() -> Command {
+pub fn curl() -> Command {
     #[allow(unused_mut)]
     let mut command = Command::new("curl");
     #[cfg(windows)]
@@ -160,11 +196,7 @@ fn curl() -> Command {
 }
 
 fn utc_clock() -> String {
-    let secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs());
-    let day = secs % 86_400;
-    format!("{:02}:{:02} UTC", day / 3600, day % 3600 / 60)
+    crate::format::unix_clock(crate::format::unix_now())
 }
 
 // ---------------------------------------------------------------------------
@@ -197,13 +229,170 @@ pub fn catalogue_info() -> Catalogue {
     let Some(path) = catalogue_path() else {
         return Catalogue::Missing;
     };
-    match std::fs::metadata(&path) {
-        Ok(m) if m.is_file() => Catalogue::Present {
+    match local_version(&path) {
+        Some(version) => Catalogue::Present {
             date: catalogue_date(&path),
-            bytes: m.len(),
+            bytes: version.length.unwrap_or(0),
         },
-        _ => Catalogue::Missing,
+        None => Catalogue::Missing,
     }
+}
+
+/// What tells one version of the catalogue on the MPC server from another:
+/// its `ETag`, `Last-Modified` (as Unix time) and `Content-Length`.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Version {
+    pub etag: Option<String>,
+    pub modified: Option<u64>,
+    pub length: Option<u64>,
+}
+
+impl Version {
+    /// Headers of the last response (after redirects) in `curl -I` / `-D` output.
+    fn from_headers(head: &str) -> Version {
+        let last = head
+            .split("\n")
+            .collect::<Vec<_>>()
+            .rsplit(|l| l.starts_with("HTTP/"))
+            .next()
+            .map(|lines| lines.join("\n"))
+            .unwrap_or_default();
+        let mut v = Version::default();
+        for (key, value) in last.lines().filter_map(|l| l.split_once(':')) {
+            let value = value.trim();
+            match key.trim().to_ascii_lowercase().as_str() {
+                "etag" if !value.is_empty() => v.etag = Some(value.to_owned()),
+                "last-modified" => v.modified = crate::format::parse_http_date(value),
+                "content-length" => v.length = value.parse().ok(),
+                _ => {}
+            }
+        }
+        v
+    }
+
+    fn parse(text: &str) -> Version {
+        let mut v = Version::default();
+        for (key, value) in text.lines().filter_map(|l| l.split_once('=')) {
+            let value = value.trim();
+            match key.trim() {
+                "etag" if !value.is_empty() => v.etag = Some(value.to_owned()),
+                "modified" => v.modified = value.parse().ok(),
+                "length" => v.length = value.parse().ok(),
+                _ => {}
+            }
+        }
+        v
+    }
+
+    fn to_text(&self) -> String {
+        let mut out = String::new();
+        if let Some(e) = &self.etag {
+            out += &format!("etag={e}\n");
+        }
+        if let Some(m) = self.modified {
+            out += &format!("modified={m}\n");
+        }
+        if let Some(l) = self.length {
+            out += &format!("length={l}\n");
+        }
+        out
+    }
+
+    /// True if the server's `self` differs from the `local` copy. Compares
+    /// the ETag first, then the modification time, then the size; when
+    /// nothing can be compared, assumes it is newer.
+    pub fn is_newer_than(&self, local: &Version) -> bool {
+        if let (Some(a), Some(b)) = (&self.etag, &local.etag) {
+            return a != b;
+        }
+        // A local time is the server's Last-Modified, or (for catalogues
+        // downloaded before versions were recorded) the file's own time,
+        // which is later than the version it holds.
+        if let (Some(a), Some(b)) = (self.modified, local.modified) {
+            return a > b;
+        }
+        if let (Some(a), Some(b)) = (self.length, local.length) {
+            return a != b;
+        }
+        true
+    }
+}
+
+fn meta_path(catalogue: &Path) -> PathBuf {
+    catalogue.with_extension("gz.meta")
+}
+
+/// The local catalogue's version: from the sidecar file written after the
+/// download, else its file time and size. `None` if there is no catalogue.
+fn local_version(path: &Path) -> Option<Version> {
+    let meta = std::fs::metadata(path).ok().filter(|m| m.is_file())?;
+    let mut v = std::fs::read_to_string(meta_path(path))
+        .map(|t| Version::parse(&t))
+        .unwrap_or_default();
+    if v.etag.is_none() && v.modified.is_none() {
+        v.modified = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs());
+    }
+    v.length = v.length.or(Some(meta.len()));
+    Some(v)
+}
+
+/// The catalogue's version on the MPC server (a HEAD request, a few hundred bytes).
+fn remote_version() -> Result<Version, String> {
+    let out = curl()
+        .args(["-sSfLI", "--max-time", "30", MPCORB_URL])
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|_| NO_CURL.to_owned())?;
+    if !out.status.success() {
+        return Err(
+            "Couldn't reach the Minor Planet Center — check the internet connection.".into(),
+        );
+    }
+    Ok(Version::from_headers(&String::from_utf8_lossy(&out.stdout)))
+}
+
+/// Whether the server has a newer catalogue than the local one.
+pub enum Freshness {
+    /// The local catalogue is the server's current one.
+    Current(Version),
+    /// The server has a different (newer) catalogue, or there is none here.
+    Newer(Version),
+}
+
+/// Asks the server (HEAD only) whether the local catalogue is current, on
+/// a background thread.
+pub fn start_check(ctx: &egui::Context) -> Receiver<Result<Freshness, String>> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let ctx = ctx.clone();
+    std::thread::spawn(move || {
+        let result = remote_version().map(|remote| {
+            match catalogue_path().as_deref().and_then(local_version) {
+                Some(local) if !remote.is_newer_than(&local) => Freshness::Current(remote),
+                _ => Freshness::Newer(remote),
+            }
+        });
+        let _ = tx.send(result);
+        ctx.request_repaint();
+    });
+    rx
+}
+
+/// Seconds since the local catalogue's version was published (or
+/// downloaded), if there is one.
+pub fn catalogue_age() -> Option<u64> {
+    let v = local_version(&catalogue_path()?)?;
+    Some(crate::format::unix_now().saturating_sub(v.modified?))
+}
+
+/// How a download ended.
+pub enum Fetched {
+    Downloaded,
+    /// The server's catalogue is the one already here; nothing was fetched.
+    AlreadyCurrent,
 }
 
 /// A catalogue download in progress. Dropping it does not stop it; use
@@ -214,7 +403,7 @@ pub struct Download {
     pub total: Arc<AtomicU64>,
     pub checking: Arc<AtomicBool>,
     cancel: Arc<AtomicBool>,
-    pub rx: Receiver<Result<(), String>>,
+    pub rx: Receiver<Result<Fetched, String>>,
 }
 
 impl Download {
@@ -226,7 +415,8 @@ impl Download {
 /// Downloads the catalogue next to the preferences: into a `.part` file,
 /// which is checked (a complete gzip with an MPCORB header) and only then
 /// renamed over the old catalogue, so a failed or cancelled download never
-/// replaces a good one.
+/// replaces a good one. A HEAD request first skips the download when the
+/// server's catalogue is the one already here.
 pub fn start_download(ctx: &egui::Context) -> Download {
     let (tx, rx) = std::sync::mpsc::channel();
     let d = Download {
@@ -257,23 +447,26 @@ fn download(
     total: &AtomicU64,
     checking: &AtomicBool,
     cancel: &AtomicBool,
-) -> Result<(), String> {
+) -> Result<Fetched, String> {
     let path = catalogue_path().ok_or("Couldn't find the app's data folder.")?;
     let dir = path
         .parent()
         .ok_or("Couldn't find the app's data folder.")?;
     std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     let part = path.with_extension("gz.part");
+    let headers = path.with_extension("gz.headers");
     let _ = std::fs::remove_file(&part);
 
-    // The size, for progress; the download works without it.
-    if let Ok(head) = curl()
-        .args(["-sSfLI", "--max-time", "30", MPCORB_URL])
-        .stdin(Stdio::null())
-        .output()
-    {
-        let text = String::from_utf8_lossy(&head.stdout);
-        if let Some(n) = content_length(&text) {
+    // The server's version: skips an unchanged catalogue and gives the size
+    // for progress. The download works without it.
+    let remote = remote_version().ok();
+    if let Some(remote) = &remote {
+        if let Some(local) = local_version(&path)
+            && !remote.is_newer_than(&local)
+        {
+            return Ok(Fetched::AlreadyCurrent);
+        }
+        if let Some(n) = remote.length {
             total.store(n, Ordering::Relaxed);
         }
     }
@@ -281,7 +474,9 @@ fn download(
     let mut child = curl()
         .args(["-sSfL", "--connect-timeout", "30"])
         // Give up when the transfer stalls (< 1 kB/s for a minute).
-        .args(["--speed-limit", "1024", "--speed-time", "60", "-o"])
+        .args(["--speed-limit", "1024", "--speed-time", "60", "-D"])
+        .arg(&headers)
+        .arg("-o")
         .arg(&part)
         .arg(MPCORB_URL)
         .stdin(Stdio::null())
@@ -289,11 +484,15 @@ fn download(
         .stderr(Stdio::null())
         .spawn()
         .map_err(|_| NO_CURL.to_owned())?;
+    let cleanup = || {
+        let _ = std::fs::remove_file(&part);
+        let _ = std::fs::remove_file(&headers);
+    };
     let status = loop {
         if cancel.load(Ordering::Relaxed) {
             let _ = child.kill();
             let _ = child.wait();
-            let _ = std::fs::remove_file(&part);
+            cleanup();
             return Err("Download cancelled.".into());
         }
         if let Some(status) = child.try_wait().map_err(|e| e.to_string())? {
@@ -306,7 +505,7 @@ fn download(
         std::thread::sleep(Duration::from_millis(250));
     };
     if !status.success() {
-        let _ = std::fs::remove_file(&part);
+        cleanup();
         return Err(
             "Couldn't download the MPCORB catalogue — check the internet connection \
                     and try again."
@@ -316,22 +515,26 @@ fn download(
     checking.store(true, Ordering::Relaxed);
     ctx.request_repaint();
     if let Err(e) = verify(&part, cancel) {
-        let _ = std::fs::remove_file(&part);
+        cleanup();
         return Err(e);
     }
+    // The version of what was actually downloaded, from its own headers.
+    let got = std::fs::read_to_string(&headers)
+        .map(|h| Version::from_headers(&h))
+        .ok()
+        .filter(|v| v.etag.is_some() || v.modified.is_some())
+        .or(remote);
+    let _ = std::fs::remove_file(&headers);
+    let meta = meta_path(&path);
+    let _ = std::fs::remove_file(&meta);
     std::fs::rename(&part, &path).map_err(|e| {
-        let _ = std::fs::remove_file(&part);
+        cleanup();
         format!("Couldn't save the MPCORB catalogue: {e}")
-    })
-}
-
-/// `Content-Length` of the last response (after redirects) in `curl -I` output.
-fn content_length(head: &str) -> Option<u64> {
-    head.lines()
-        .filter_map(|l| l.split_once(':'))
-        .filter(|(k, _)| k.trim().eq_ignore_ascii_case("content-length"))
-        .filter_map(|(_, v)| v.trim().parse().ok())
-        .next_back()
+    })?;
+    if let Some(v) = got {
+        let _ = std::fs::write(&meta, v.to_text());
+    }
+    Ok(Fetched::Downloaded)
 }
 
 /// Reads the whole file through the gzip checks (CRC and length) and makes
@@ -377,11 +580,71 @@ mod tests {
     use super::*;
 
     #[test]
-    fn content_length_after_redirect() {
-        let head = "HTTP/1.1 301 Moved\r\nContent-Length: 162\r\nLocation: x\r\n\r\n\
-                    HTTP/1.1 200 OK\r\ncontent-length: 98765432\r\n\r\n";
-        assert_eq!(content_length(head), Some(98_765_432));
-        assert_eq!(content_length("HTTP/2 200\r\n"), None);
+    fn version_from_last_response_after_redirect() {
+        let head = "HTTP/1.1 301 Moved\r\nContent-Length: 162\r\nLocation: x\r\nETag: \"old\"\r\n\r\n\
+                    HTTP/1.1 200 OK\r\ncontent-length: 94068293\r\n\
+                    Last-Modified: Thu, 29 Oct 2026 13:04:33 GMT\r\n\
+                    ETag: \"59b5e45-65efa522a4343\"\r\nAccept-Ranges: bytes\r\n\r\n";
+        let v = Version::from_headers(head);
+        assert_eq!(v.length, Some(94_068_293));
+        assert_eq!(v.etag.as_deref(), Some("\"59b5e45-65efa522a4343\""));
+        assert_eq!(
+            v.modified,
+            crate::format::parse_http_date("Thu, 29 Oct 2026 13:04:33 GMT")
+        );
+        assert_eq!(Version::parse(&v.to_text()), v);
+        assert_eq!(Version::from_headers("HTTP/2 200\r\n"), Version::default());
+    }
+
+    #[test]
+    fn compares_etag_then_time_then_size() {
+        let v = |etag: Option<&str>, modified: Option<u64>, length: Option<u64>| Version {
+            etag: etag.map(str::to_owned),
+            modified,
+            length,
+        };
+        let server = v(Some("b"), Some(200), Some(10));
+        // ETag decides when both have one, even if the times say otherwise.
+        assert!(!server.is_newer_than(&v(Some("b"), Some(900), Some(5))));
+        assert!(server.is_newer_than(&v(Some("a"), Some(900), Some(10))));
+        // No local ETag (old download): file time, then size.
+        assert!(!server.is_newer_than(&v(None, Some(300), Some(1))));
+        assert!(server.is_newer_than(&v(None, Some(100), Some(10))));
+        assert!(!server.is_newer_than(&v(None, None, Some(10))));
+        assert!(server.is_newer_than(&v(None, None, Some(11))));
+        assert!(server.is_newer_than(&Version::default()));
+    }
+
+    #[test]
+    fn merges_skybot_replies() {
+        let o = |number: Option<&str>, name: &str, mag: f64| KnownObject {
+            number: number.map(str::to_owned),
+            name: name.to_owned(),
+            ra: 0.0,
+            dec: 0.0,
+            class: String::new(),
+            magnitude: Some(mag),
+            uncertainty: 0.0,
+            motion_ra: 0.0,
+            motion_dec: 0.0,
+        };
+        let a = vec![o(Some("133105"), "2000 AA", 19.0)];
+        let b = vec![
+            o(Some("133105"), "2000 AA", 99.0),
+            o(None, "2026 RA34", 21.0),
+        ];
+        let merged = merge_replies(Ok(a.clone()), Ok(b)).unwrap();
+        let labels: Vec<_> = merged.iter().map(|o| (o.label(), o.magnitude)).collect();
+        assert_eq!(labels, [("133105", Some(19.0)), ("2026 RA34", Some(21.0))]);
+        assert_eq!(
+            merge_replies(Err("x".into()), Ok(a.clone())).unwrap().len(),
+            1
+        );
+        assert_eq!(merge_replies(Ok(a), Err("x".into())).unwrap().len(), 1);
+        assert_eq!(
+            merge_replies(Err("first".into()), Err("second".into())).unwrap_err(),
+            "first"
+        );
     }
 
     /// The Update MPCORB path end to end (downloads ~94 MB into the app
@@ -393,7 +656,7 @@ mod tests {
         let ctx = egui::Context::default();
         let d = start_download(&ctx);
         let started = std::time::Instant::now();
-        d.rx.recv().unwrap().unwrap();
+        let _ = d.rx.recv().unwrap().unwrap();
         println!(
             "downloaded {} of {} bytes in {:.0?}",
             d.received.load(Ordering::Relaxed),

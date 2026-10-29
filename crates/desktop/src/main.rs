@@ -12,7 +12,9 @@ mod icons;
 mod known;
 mod load;
 mod prefs;
+mod settings;
 mod theme;
+mod update;
 mod zip;
 
 use eframe::egui;
@@ -29,8 +31,12 @@ fn main() -> eframe::Result {
         .as_ref()
         .and_then(|c| c.state.size)
         .unwrap_or([1280.0, 820.0]);
+    let viewport = egui::ViewportBuilder::default();
+    // macOS takes the icon from the app bundle.
+    #[cfg(not(target_os = "macos"))]
+    let viewport = viewport.with_icon(window_icon());
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
+        viewport: viewport
             .with_title("OpenCeres")
             .with_app_id("org.openceres.desktop")
             .with_inner_size(size)
@@ -49,4 +55,30 @@ fn main() -> eframe::Result {
         options,
         Box::new(|cc| Ok(Box::new(app::App::new(cc, paths, capture)))),
     )
+}
+
+/// The window icon (Windows title bar and taskbar, Linux window list):
+/// 256 × 256 RGBA, zlib-compressed by `assets/make_icons.py`.
+#[cfg(not(target_os = "macos"))]
+fn window_icon() -> egui::IconData {
+    let packed = include_bytes!("../assets/icon-256.rgba.z");
+    let rgba = miniz_oxide::inflate::decompress_to_vec_zlib(packed).unwrap_or_default();
+    if rgba.len() != 256 * 256 * 4 {
+        return egui::IconData::default();
+    }
+    egui::IconData {
+        rgba,
+        width: 256,
+        height: 256,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn window_icon_inflates_to_256_square_rgba() {
+        let packed = include_bytes!("../assets/icon-256.rgba.z");
+        let rgba = miniz_oxide::inflate::decompress_to_vec_zlib(packed).unwrap();
+        assert_eq!(rgba.len(), 256 * 256 * 4);
+    }
 }

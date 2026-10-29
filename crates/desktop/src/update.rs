@@ -39,7 +39,7 @@ pub enum Check {
 /// Asks GitHub for the latest release. Errors are short, user-readable
 /// strings; a private or missing repository reads as "no releases".
 pub fn check() -> Result<Check, String> {
-    let output = Command::new("curl")
+    let output = crate::known::curl()
         .args(["-sS", "--max-time", "20", "-w", "\n%{http_code}"])
         .args(["-H", "Accept: application/vnd.github+json"])
         .args(["-H", &format!("User-Agent: OpenCeres/{CURRENT_VERSION}")])
@@ -55,7 +55,9 @@ pub fn check() -> Result<Check, String> {
         "200" => {}
         // Private repository or no release published yet.
         "404" => return Ok(Check::UpToDate),
-        "403" | "429" => return Err("GitHub is rate-limiting update checks; try again later.".into()),
+        "403" | "429" => {
+            return Err("GitHub is rate-limiting update checks; try again later.".into());
+        }
         code => return Err(format!("GitHub answered {code} to the update check.")),
     }
     let release = parse_release(body, platform_suffix())?;
@@ -83,14 +85,24 @@ pub fn platform_suffix() -> Option<&'static str> {
 fn parse_release(json: &str, suffix: Option<&str>) -> Result<Release, String> {
     let bad = || "GitHub sent an unexpected update reply.".to_string();
     let root = json::parse(json).map_err(|_| bad())?;
-    let tag = root.get("tag_name").and_then(json::Value::as_str).ok_or_else(bad)?;
-    let page = root.get("html_url").and_then(json::Value::as_str).unwrap_or_default();
+    let tag = root
+        .get("tag_name")
+        .and_then(json::Value::as_str)
+        .ok_or_else(bad)?;
+    let page = root
+        .get("html_url")
+        .and_then(json::Value::as_str)
+        .unwrap_or_default();
     let asset = suffix.and_then(|suffix| {
         root.get("assets")?.as_array()?.iter().find_map(|a| {
             let name = a.get("name")?.as_str()?;
             name.ends_with(suffix).then(|| Asset {
                 name: name.to_string(),
-                url: a.get("browser_download_url").and_then(json::Value::as_str).unwrap_or_default().to_string(),
+                url: a
+                    .get("browser_download_url")
+                    .and_then(json::Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
                 size: a.get("size").and_then(json::Value::as_f64).unwrap_or(0.0) as u64,
                 sha256: a
                     .get("digest")
@@ -115,7 +127,11 @@ pub fn is_newer(candidate: &str, current: &str) -> bool {
             return None;
         }
         let mut parts = v.split('.').map(|p| p.parse::<u64>().ok());
-        let version = [parts.next()??, parts.next().unwrap_or(Some(0))?, parts.next().unwrap_or(Some(0))?];
+        let version = [
+            parts.next()??,
+            parts.next().unwrap_or(Some(0))?,
+            parts.next().unwrap_or(Some(0))?,
+        ];
         parts.next().is_none().then_some(version)
     }
     matches!((parse(candidate), parse(current)), (Some(a), Some(b)) if a > b)
@@ -127,7 +143,7 @@ pub fn is_newer(candidate: &str, current: &str) -> bool {
 pub fn download(asset: &Asset, dir: &Path) -> Result<PathBuf, String> {
     let target = dir.join(&asset.name);
     let partial = dir.join(format!("{}.part", asset.name));
-    let status = Command::new("curl")
+    let status = crate::known::curl()
         .args(["-sSfL", "--max-time", "900", "-o"])
         .arg(&partial)
         .arg(&asset.url)
@@ -139,16 +155,23 @@ pub fn download(asset: &Asset, dir: &Path) -> Result<PathBuf, String> {
         msg
     };
     if !status.success() {
-        return Err(fail("The download failed — check the internet connection.".into()));
+        return Err(fail(
+            "The download failed — check the internet connection.".into(),
+        ));
     }
     if let Some(expected) = &asset.sha256 {
         match sha256_file(&partial) {
             Ok(actual) if &actual == expected => {}
-            Ok(_) => return Err(fail("The download was corrupt (checksum mismatch) and was deleted.".into())),
+            Ok(_) => {
+                return Err(fail(
+                    "The download was corrupt (checksum mismatch) and was deleted.".into(),
+                ));
+            }
             Err(e) => return Err(fail(format!("Couldn't check the download: {e}"))),
         }
     }
-    std::fs::rename(&partial, &target).map_err(|e| fail(format!("Couldn't save the download: {e}")))?;
+    std::fs::rename(&partial, &target)
+        .map_err(|e| fail(format!("Couldn't save the download: {e}")))?;
     Ok(target)
 }
 
@@ -160,12 +183,14 @@ pub fn reveal(path: &Path) {
     } else if cfg!(target_os = "windows") {
         Command::new("explorer").arg("/select,").arg(path).spawn()
     } else {
-        Command::new("xdg-open").arg(path.parent().unwrap_or(path)).spawn()
+        Command::new("xdg-open")
+            .arg(path.parent().unwrap_or(path))
+            .spawn()
     };
     let _ = result;
 }
 
-/// Opens a web page in the default browser.
+/// Opens a web page in the default browser (or a folder in the file manager).
 pub fn open_url(url: &str) {
     let _ = if cfg!(target_os = "macos") {
         Command::new("open").arg(url).spawn()
@@ -178,7 +203,8 @@ pub fn open_url(url: &str) {
 
 /// The user's Downloads folder, falling back to the home folder.
 pub fn downloads_dir() -> Option<PathBuf> {
-    let home = std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" }).map(PathBuf::from)?;
+    let home =
+        std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" }).map(PathBuf::from)?;
     let downloads = home.join("Downloads");
     Some(if downloads.is_dir() { downloads } else { home })
 }
@@ -201,14 +227,16 @@ fn sha256_file(path: &Path) -> std::io::Result<String> {
 /// SHA-256 (FIPS 180-4), small and streaming.
 mod sha256 {
     const K: [u32; 64] = [
-        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
-        0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
-        0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
-        0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
-        0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
-        0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
-        0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
-        0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
+        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4,
+        0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe,
+        0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f,
+        0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
+        0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc,
+        0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b,
+        0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116,
+        0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+        0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7,
+        0xc67178f2,
     ];
 
     pub struct Sha256 {
@@ -222,7 +250,8 @@ mod sha256 {
         pub fn new() -> Self {
             Sha256 {
                 state: [
-                    0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
+                    0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c,
+                    0x1f83d9ab, 0x5be0cd19,
                 ],
                 block: [0; 64],
                 filled: 0,
@@ -257,23 +286,39 @@ mod sha256 {
 
         fn compress(&mut self, block: &[u8; 64]) {
             let mut w = [0u32; 64];
-            for (i, chunk) in block.chunks_exact(4).enumerate() {
-                w[i] = u32::from_be_bytes(chunk.try_into().unwrap());
+            for (w, chunk) in w.iter_mut().zip(block.as_chunks::<4>().0) {
+                *w = u32::from_be_bytes(*chunk);
             }
             for i in 16..64 {
                 let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
                 let s1 = w[i - 2].rotate_right(17) ^ w[i - 2].rotate_right(19) ^ (w[i - 2] >> 10);
-                w[i] = w[i - 16].wrapping_add(s0).wrapping_add(w[i - 7]).wrapping_add(s1);
+                w[i] = w[i - 16]
+                    .wrapping_add(s0)
+                    .wrapping_add(w[i - 7])
+                    .wrapping_add(s1);
             }
             let mut v = self.state;
             for i in 0..64 {
                 let s1 = v[4].rotate_right(6) ^ v[4].rotate_right(11) ^ v[4].rotate_right(25);
                 let ch = (v[4] & v[5]) ^ (!v[4] & v[6]);
-                let t1 = v[7].wrapping_add(s1).wrapping_add(ch).wrapping_add(K[i]).wrapping_add(w[i]);
+                let t1 = v[7]
+                    .wrapping_add(s1)
+                    .wrapping_add(ch)
+                    .wrapping_add(K[i])
+                    .wrapping_add(w[i]);
                 let s0 = v[0].rotate_right(2) ^ v[0].rotate_right(13) ^ v[0].rotate_right(22);
                 let maj = (v[0] & v[1]) ^ (v[0] & v[2]) ^ (v[1] & v[2]);
                 let t2 = s0.wrapping_add(maj);
-                v = [t1.wrapping_add(t2), v[0], v[1], v[2], v[3].wrapping_add(t1), v[4], v[5], v[6]];
+                v = [
+                    t1.wrapping_add(t2),
+                    v[0],
+                    v[1],
+                    v[2],
+                    v[3].wrapping_add(t1),
+                    v[4],
+                    v[5],
+                    v[6],
+                ];
             }
             for (s, x) in self.state.iter_mut().zip(v) {
                 *s = s.wrapping_add(x);
@@ -322,7 +367,11 @@ mod json {
     }
 
     pub fn parse(text: &str) -> Result<Value, ()> {
-        let mut p = Parser { s: text.as_bytes(), i: 0, depth: 0 };
+        let mut p = Parser {
+            s: text.as_bytes(),
+            i: 0,
+            depth: 0,
+        };
         let v = p.value()?;
         p.ws();
         if p.i == p.s.len() { Ok(v) } else { Err(()) }
@@ -411,7 +460,12 @@ mod json {
                 b'n' => self.word("null", Value::Null)?,
                 _ => {
                     let start = self.i;
-                    while self.i < self.s.len() && matches!(self.s[self.i], b'-' | b'+' | b'.' | b'e' | b'E' | b'0'..=b'9') {
+                    while self.i < self.s.len()
+                        && matches!(
+                            self.s[self.i],
+                            b'-' | b'+' | b'.' | b'e' | b'E' | b'0'..=b'9'
+                        )
+                    {
                         self.i += 1;
                     }
                     let n = std::str::from_utf8(&self.s[start..self.i]).map_err(|_| ())?;
@@ -456,10 +510,14 @@ mod json {
                             b'f' => out.push(12),
                             b'u' => {
                                 let mut code = self.hex4()?;
-                                if (0xD800..0xDC00).contains(&code) && self.s[self.i..].starts_with(b"\\u") {
+                                if (0xD800..0xDC00).contains(&code)
+                                    && self.s[self.i..].starts_with(b"\\u")
+                                {
                                     self.i += 2;
                                     let low = self.hex4()?;
-                                    code = 0x10000 + ((code - 0xD800) << 10) + (low.wrapping_sub(0xDC00) & 0x3ff);
+                                    code = 0x10000
+                                        + ((code - 0xD800) << 10)
+                                        + (low.wrapping_sub(0xDC00) & 0x3ff);
                                 }
                                 let ch = char::from_u32(code).unwrap_or('\u{fffd}');
                                 out.extend_from_slice(ch.to_string().as_bytes());
@@ -494,8 +552,14 @@ mod tests {
             h.update(data);
             h.finish_hex()
         };
-        assert_eq!(hex(b""), "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
-        assert_eq!(hex(b"abc"), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+        assert_eq!(
+            hex(b""),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        assert_eq!(
+            hex(b"abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
         assert_eq!(
             hex(b"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"),
             "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1"
@@ -506,7 +570,10 @@ mod tests {
         for chunk in data.chunks(997) {
             h.update(chunk);
         }
-        assert_eq!(h.finish_hex(), "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0");
+        assert_eq!(
+            h.finish_hex(),
+            "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0"
+        );
     }
 
     #[test]
@@ -538,18 +605,32 @@ mod tests {
         assert_eq!(r.version, "0.2.0");
         assert!(r.page.ends_with("/v0.2.0"));
         let asset = r.asset.unwrap();
-        assert_eq!((asset.name.as_str(), asset.size), ("OpenCeres-0.2.0-macos.dmg", 7_877_583));
+        assert_eq!(
+            (asset.name.as_str(), asset.size),
+            ("OpenCeres-0.2.0-macos.dmg", 7_877_583)
+        );
         assert_eq!(asset.sha256.as_deref(), Some("cd34"));
-        let linux = parse_release(REPLY, Some("-linux-x86_64.tar.gz")).unwrap().asset.unwrap();
+        let linux = parse_release(REPLY, Some("-linux-x86_64.tar.gz"))
+            .unwrap()
+            .asset
+            .unwrap();
         assert_eq!(linux.sha256.as_deref(), Some("ab12"));
-        assert_eq!(parse_release(REPLY, Some("-windows-x86_64.zip")).unwrap().asset, None);
+        assert_eq!(
+            parse_release(REPLY, Some("-windows-x86_64.zip"))
+                .unwrap()
+                .asset,
+            None
+        );
         assert!(parse_release("not json", None).is_err());
     }
 
     #[test]
     fn json_strings_and_nesting() {
         let v = json::parse(REPLY).unwrap();
-        assert_eq!(v.get("body").and_then(json::Value::as_str), Some("Notes with \"quotes\", a newline\n and é 🚀"));
+        assert_eq!(
+            v.get("body").and_then(json::Value::as_str),
+            Some("Notes with \"quotes\", a newline\n and é 🚀")
+        );
         assert_eq!(v.get("draft"), Some(&json::Value::Bool(false)));
         assert!(json::parse("[1, 2").is_err());
         assert!(json::parse(&"[".repeat(100)).is_err()); // nesting limit

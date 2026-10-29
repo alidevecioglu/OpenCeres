@@ -4,9 +4,12 @@
 //!
 //! Most values are *defaults*: what a new session starts with. Toggling stars
 //! or invert in the toolbar changes only the current session; the Settings
-//! window changes the defaults (and applies them right away).
+//! window changes the defaults (and applies them right away). Which keys
+//! exist is defined by the settings registry in [`crate::settings`].
 
 use std::path::PathBuf;
+
+use crate::settings;
 
 /// Blink speeds, seconds per frame.
 pub const SPEEDS: [f32; 8] = [0.2, 0.3, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0];
@@ -23,22 +26,6 @@ pub enum ThemeChoice {
 
 impl ThemeChoice {
     pub const ALL: [ThemeChoice; 3] = [ThemeChoice::System, ThemeChoice::Light, ThemeChoice::Dark];
-
-    pub fn label(self) -> &'static str {
-        match self {
-            ThemeChoice::System => "System",
-            ThemeChoice::Light => "Light",
-            ThemeChoice::Dark => "Dark",
-        }
-    }
-
-    fn key(self) -> &'static str {
-        match self {
-            ThemeChoice::System => "system",
-            ThemeChoice::Light => "light",
-            ThemeChoice::Dark => "dark",
-        }
-    }
 }
 
 /// Where known objects come from.
@@ -60,13 +47,6 @@ impl KnownSource {
             KnownSource::Mpcorb => "MPCORB",
         }
     }
-
-    fn key(self) -> &'static str {
-        match self {
-            KnownSource::SkyBot => "skybot",
-            KnownSource::Mpcorb => "mpcorb",
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -79,6 +59,12 @@ pub struct Prefs {
     /// Whether the report side panel is open.
     pub panel_open: bool,
     pub known_source: KnownSource,
+    pub update_check: bool,
+    /// Unix time of the last update check that found nothing new (0 = never).
+    pub update_last_check: u64,
+    /// Unix time of the last background MPCORB check that found the
+    /// catalogue current (0 = never).
+    pub mpcorb_last_check: u64,
 }
 
 impl Default for Prefs {
@@ -91,42 +77,33 @@ impl Default for Prefs {
             grid_size: 4,
             panel_open: false,
             known_source: KnownSource::SkyBot,
+            update_check: true,
+            update_last_check: 0,
+            mpcorb_last_check: 0,
         }
     }
 }
 
 impl Prefs {
+    /// Settings from the registry (see [`crate::settings`]), plus the
+    /// app's own state.
     pub fn parse(text: &str) -> Prefs {
         let mut p = Prefs::default();
         for line in text.lines() {
             let Some((key, value)) = line.split_once('=') else {
                 continue;
             };
-            let value = value.trim();
-            let flag = |old: bool| value.parse().unwrap_or(old);
-            match key.trim() {
-                "theme" => {
-                    if let Some(t) = ThemeChoice::ALL.into_iter().find(|t| t.key() == value) {
-                        p.theme = t;
-                    }
+            let (key, value) = (key.trim(), value.trim());
+            if settings::read(&mut p, key, value) {
+                continue;
+            }
+            match key {
+                "panel_open" => p.panel_open = value.parse().unwrap_or(p.panel_open),
+                "update_last_check" => {
+                    p.update_last_check = value.parse().unwrap_or(p.update_last_check);
                 }
-                "blink_seconds" => {
-                    if let Ok(s) = value.parse::<f32>() {
-                        p.blink_seconds = nearest_speed(s);
-                    }
-                }
-                "show_stars" => p.show_stars = flag(p.show_stars),
-                "invert" => p.invert = flag(p.invert),
-                "grid_size" => {
-                    if let Some(n) = value.parse().ok().filter(|n| GRID_SIZES.contains(n)) {
-                        p.grid_size = n;
-                    }
-                }
-                "panel_open" => p.panel_open = flag(p.panel_open),
-                "known_source" => {
-                    if let Some(k) = KnownSource::ALL.into_iter().find(|k| k.key() == value) {
-                        p.known_source = k;
-                    }
+                "mpcorb_last_check" => {
+                    p.mpcorb_last_check = value.parse().unwrap_or(p.mpcorb_last_check);
                 }
                 _ => {}
             }
@@ -135,17 +112,13 @@ impl Prefs {
     }
 
     pub fn to_text(self) -> String {
-        format!(
-            "theme={}\nblink_seconds={}\nshow_stars={}\ninvert={}\ngrid_size={}\npanel_open={}\n\
-             known_source={}\n",
-            self.theme.key(),
-            self.blink_seconds,
-            self.show_stars,
-            self.invert,
-            self.grid_size,
-            self.panel_open,
-            self.known_source.key()
-        )
+        let mut out = String::new();
+        settings::write(&self, &mut out);
+        out += &format!(
+            "panel_open={}\nupdate_last_check={}\nmpcorb_last_check={}\n",
+            self.panel_open, self.update_last_check, self.mpcorb_last_check
+        );
+        out
     }
 
     pub fn load() -> Prefs {
@@ -163,13 +136,6 @@ impl Prefs {
             let _ = std::fs::write(path, self.to_text());
         }
     }
-}
-
-pub fn nearest_speed(s: f32) -> f32 {
-    SPEEDS
-        .into_iter()
-        .min_by(|a, b| (a - s).abs().total_cmp(&(b - s).abs()))
-        .unwrap_or(0.5)
 }
 
 fn env_dir(key: &str) -> Option<PathBuf> {
@@ -210,6 +176,9 @@ mod tests {
             grid_size: 6,
             panel_open: true,
             known_source: KnownSource::Mpcorb,
+            update_check: false,
+            update_last_check: 1_793_279_073,
+            mpcorb_last_check: 1_793_279_000,
         };
         assert_eq!(Prefs::parse(&p.to_text()), p);
     }

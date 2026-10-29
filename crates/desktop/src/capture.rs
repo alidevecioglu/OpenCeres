@@ -11,7 +11,9 @@
 //! (and never saves them), opens the paths given on the command line, waits
 //! until they have loaded and a few frames have been drawn, saves a PNG of
 //! its own window and exits. `OPENCERES_SCREENSHOT_STATE` is a comma list of:
-//! `light`, `dark`, `stars`, `invert`, `grid`, `panel`, `settings`, `help`,
+//! `light`, `dark`, `stars`, `invert`, `grid`, `panel`, `settings` (or
+//! `settings=PAGE`, e.g. `settings=updates`), `search=TEXT` (in Settings),
+//! `update=VERSION` (pretend that version is available), `help`,
 //! `paused`, `frame=N` (1-based), `mark=RxC` (row × column, repeatable),
 //! `gridsize=N`, `known` (look up known objects and wait for the answer),
 //! `focus=LABEL` (centre and zoom on that known object) and `size=WxH`
@@ -27,6 +29,9 @@ pub struct State {
     pub grid: bool,
     pub panel: bool,
     pub settings: bool,
+    pub settings_page: Option<String>,
+    pub search: Option<String>,
+    pub update: Option<String>,
     pub help: bool,
     pub paused: bool,
     pub known: bool,
@@ -84,7 +89,12 @@ impl State {
                 "invert" => s.invert = true,
                 "grid" => s.grid = true,
                 "panel" => s.panel = true,
-                "settings" => s.settings = true,
+                "settings" => {
+                    s.settings = true;
+                    s.settings_page = Some(value.to_owned()).filter(|v| !v.is_empty());
+                }
+                "search" => s.search = Some(value.to_owned()),
+                "update" => s.update = Some(value.to_owned()).filter(|v| !v.is_empty()),
                 "help" => s.help = true,
                 "paused" => s.paused = true,
                 "known" => s.known = true,

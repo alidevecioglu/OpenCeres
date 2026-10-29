@@ -24,6 +24,13 @@ pub enum Icon {
     Gear,
     Close,
     Check,
+    // Settings categories and search.
+    Theme,
+    Eye,
+    Update,
+    Keyboard,
+    Info,
+    Search,
 }
 
 pub fn paint(painter: &egui::Painter, rect: Rect, icon: Icon, color: Color32) {
@@ -130,6 +137,82 @@ pub fn paint(painter: &egui::Painter, rect: Rect, icon: Icon, color: Color32) {
             let k = 4.0;
             painter.line_segment([at(-k, -k), at(k, k)], stroke);
             painter.line_segment([at(-k, k), at(k, -k)], stroke);
+        }
+        Icon::Theme => {
+            // A sun: disc and rays.
+            painter.circle_stroke(c, 3.25 * s, stroke);
+            for i in 0..8 {
+                let a = i as f32 / 8.0 * TAU;
+                let d = vec2(a.cos(), a.sin());
+                painter.line_segment(
+                    [c + d * 5.25 * s, c + d * 7.0 * s],
+                    Stroke::new(1.25, color),
+                );
+            }
+        }
+        Icon::Eye => {
+            let lid = |sign: f32| -> Vec<Pos2> {
+                (0..=16)
+                    .map(|i| {
+                        let t = i as f32 / 16.0 * 2.0 - 1.0;
+                        at(t * 7.0, sign * 4.5 * (1.0 - t * t))
+                    })
+                    .collect()
+            };
+            painter.add(Shape::line(lid(1.0), stroke));
+            painter.add(Shape::line(lid(-1.0), stroke));
+            painter.circle_filled(c, 2.25 * s, color);
+        }
+        Icon::Update => {
+            // A circular arrow.
+            let r = 5.5 * s;
+            let arc: Vec<Pos2> = (0..=20)
+                .map(|i| {
+                    let a = -0.6 + i as f32 / 20.0 * (TAU - 1.6);
+                    c + vec2(a.cos(), a.sin()) * r
+                })
+                .collect();
+            let end = arc[arc.len() - 1];
+            painter.add(Shape::line(arc, stroke));
+            let a = -0.6 + TAU - 1.6;
+            let tangent = vec2(-a.sin(), a.cos());
+            let normal = vec2(a.cos(), a.sin());
+            painter.add(Shape::convex_polygon(
+                vec![
+                    end + tangent * 3.0 * s,
+                    end - normal * 2.75 * s,
+                    end + normal * 2.75 * s,
+                ],
+                color,
+                Stroke::NONE,
+            ));
+        }
+        Icon::Keyboard => {
+            let r = Rect::from_center_size(c, vec2(15.0, 10.0) * s);
+            painter.rect_stroke(r, 2.0, stroke, egui::StrokeKind::Middle);
+            for row in [-2.0, 0.5] {
+                for col in [-4.5, -1.5, 1.5, 4.5] {
+                    painter.circle_filled(at(col, row), 0.9 * s, color);
+                }
+            }
+            painter.hline(
+                (c.x - 3.0 * s)..=(c.x + 3.0 * s),
+                c.y + 3.0 * s,
+                Stroke::new(1.25, color),
+            );
+        }
+        Icon::Info => {
+            painter.circle_stroke(c, 6.5 * s, stroke);
+            painter.circle_filled(at(0.0, -3.0), 1.0 * s, color);
+            painter.vline(
+                c.x,
+                (c.y - 0.75 * s)..=(c.y + 3.75 * s),
+                Stroke::new(1.75, color),
+            );
+        }
+        Icon::Search => {
+            painter.circle_stroke(at(-1.25, -1.25), 4.25 * s, stroke);
+            painter.line_segment([at(1.9, 1.9), at(5.5, 5.5)], Stroke::new(1.75, color));
         }
         Icon::Check => {
             painter.line(

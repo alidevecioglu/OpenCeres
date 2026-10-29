@@ -1,6 +1,9 @@
 //! The OpenCeres window: a slim toolbar, the image stage (almost all of the
 //! window), an optional report side panel and a slim status bar.
 
+pub(crate) mod settings_ui;
+
+use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, TryRecvError};
 use std::time::Duration;
 
@@ -14,10 +17,12 @@ use crate::capture::{self, Capture};
 use crate::format;
 use crate::gpu::{Draw, Gpu};
 use crate::icons::{self, Icon};
-use crate::known::{self, Catalogue, Download, Lookup, LookupError};
+use crate::known::{self, Catalogue, Download, Fetched, Freshness, Lookup, LookupError};
 use crate::load::{self, Frame as ImageFrame, ImageSet};
 use crate::prefs::{GRID_SIZES, KnownSource, Prefs, SPEEDS, ThemeChoice};
+use crate::settings::Category;
 use crate::theme::{self, S1, S2, S3, S4, S5, palette};
+use crate::update;
 use openceres_core::known::KnownObject;
 
 const MAX_SCALE: f32 = 32.0;
@@ -30,8 +35,8 @@ const SWITCH_EARLY: f64 = 0.03;
 const CAPTURE_SETTLE: u32 = 2;
 const CAPTURE_SHOOT: u32 = 6;
 const CAPTURE_WAIT: f64 = 0.6;
-/// Width of the controls in the Settings window.
-const SETTING_WIDTH: f32 = 200.0;
+/// Seconds between automatic update and catalogue checks.
+const DAY: u64 = 86_400;
 
 struct Set {
     name: String,
@@ -76,7 +81,27 @@ struct View {
     offset: Vec2,
     stage: Vec2,
     fitted: bool,
+    /// Still as fitted: not zoomed or panned since, so a new stage size
+    /// (side panel, window) fits again.
+    auto_fit: bool,
     drag: Option<Drag>,
+}
+
+/// The app update check (see [`crate::update`]).
+#[derive(Default)]
+struct Updates {
+    pending: Option<Receiver<Result<update::Check, String>>>,
+    /// The pending check was asked for in Settings, so errors are shown.
+    manual: bool,
+    /// Set once the automatic check has been considered this session.
+    auto_done: bool,
+    found: Option<update::Release>,
+    error: Option<String>,
+    /// Unix time of this session's last successful check.
+    checked_at: Option<u64>,
+    downloading: Option<Receiver<Result<PathBuf, String>>>,
+    downloaded: Option<PathBuf>,
+    download_error: Option<String>,
 }
 
 struct Drag {
@@ -112,6 +137,16 @@ pub struct App {
     known_focus: Option<usize>,
     download: Option<Download>,
     download_error: Option<String>,
+    /// e.g. "Already up to date", after a download that fetched nothing.
+    download_note: Option<String>,
+    /// MPCORB freshness check (HEAD only) and whether Settings asked for it.
+    mpcorb_check: Option<(Receiver<Result<Freshness, String>>, bool)>,
+    /// Result of the last check asked for in Settings.
+    mpcorb_fresh: Option<Result<Freshness, String>>,
+    /// The background check found a newer catalogue (hint in the panel).
+    mpcorb_newer: bool,
+    mpcorb_auto_done: bool,
+    updates: Updates,
     /// What Settings shows about the offline catalogue; `None` = read again.
     catalogue: Option<Catalogue>,
     loading: Option<Loading>,
@@ -120,6 +155,11 @@ pub struct App {
     /// Cursor position in 0-based FITS pixels (y up).
     hover: Option<(f64, f64)>,
     settings_open: bool,
+    /// Page Settings shows (and reopens on).
+    settings_page: Category,
+    settings_search: String,
+    /// "Reset all" was clicked once and waits for confirmation.
+    confirm_reset: bool,
     help_open: bool,
     capture: Option<Capture>,
 }
@@ -191,12 +231,21 @@ impl App {
             known_focus: None,
             download: None,
             download_error: None,
+            download_note: None,
+            mpcorb_check: None,
+            mpcorb_fresh: None,
+            mpcorb_newer: false,
+            mpcorb_auto_done: false,
+            updates: Updates::default(),
             catalogue: None,
             loading: None,
             error: None,
             view: View::default(),
             hover: None,
             settings_open: false,
+            settings_page: Category::General,
+            settings_search: String::new(),
+            confirm_reset: false,
             help_open: false,
             capture,
         };
@@ -409,14 +458,193 @@ impl App {
         self.download = None;
         self.catalogue = None;
         match result {
-            Ok(()) => {
+            Ok(fetched) => {
                 self.download_error = None;
-                // Look up again with the new catalogue.
-                if self.prefs.known_source == KnownSource::Mpcorb {
-                    self.known = None;
+                self.mpcorb_newer = false;
+                self.mpcorb_fresh = None;
+                self.prefs.mpcorb_last_check = format::unix_now();
+                if let Fetched::AlreadyCurrent = fetched {
+                    self.download_note =
+                        Some("Already up to date — nothing was downloaded.".into());
+                } else if self.prefs.known_source == KnownSource::Mpcorb {
+                    self.known = None; // look up again with the new catalogue
                 }
             }
             Err(e) => self.download_error = Some(e),
+        }
+    }
+
+    /// Asks the MPC whether the catalogue is current (HEAD only). Silent
+    /// checks only set the panel hint; Settings shows the result.
+    fn start_mpcorb_check(&mut self, ctx: &egui::Context, manual: bool) {
+        if self.mpcorb_check.is_none() {
+            self.mpcorb_check = Some((known::start_check(ctx), manual));
+            if manual {
+                self.mpcorb_fresh = None;
+            }
+        }
+    }
+
+    fn poll_mpcorb_check(&mut self) {
+        let Some((rx, manual)) = &self.mpcorb_check else {
+            return;
+        };
+        let manual = *manual;
+        let result = match rx.try_recv() {
+            Ok(r) => r,
+            Err(TryRecvError::Empty) => return,
+            Err(TryRecvError::Disconnected) => Err("The check stopped unexpectedly.".into()),
+        };
+        self.mpcorb_check = None;
+        match &result {
+            // Remembered only when current, so a newer catalogue is
+            // pointed out again on the next start.
+            Ok(Freshness::Current(_)) => {
+                self.prefs.mpcorb_last_check = format::unix_now();
+                self.mpcorb_newer = false;
+            }
+            Ok(Freshness::Newer(_)) => self.mpcorb_newer = true,
+            Err(_) => {}
+        }
+        if manual {
+            self.mpcorb_fresh = Some(result);
+        }
+    }
+
+    /// Once per session: the app update check (at most daily), and, with
+    /// the offline source, a catalogue check when it is over a day old.
+    /// Never retried in a loop, never downloads by itself.
+    fn auto_checks(&mut self, ctx: &egui::Context) {
+        if self.capture.is_some() {
+            return;
+        }
+        let now = format::unix_now();
+        if !self.updates.auto_done && self.prefs.update_check {
+            self.updates.auto_done = true;
+            if now.saturating_sub(self.prefs.update_last_check) >= DAY {
+                self.start_update_check(ctx, false);
+            }
+        }
+        if !self.mpcorb_auto_done && self.prefs.known_source == KnownSource::Mpcorb {
+            self.mpcorb_auto_done = true;
+            if now.saturating_sub(self.prefs.mpcorb_last_check) >= DAY
+                && known::catalogue_age().is_some_and(|age| age >= DAY)
+            {
+                self.start_mpcorb_check(ctx, false);
+            }
+        }
+    }
+
+    fn start_update_check(&mut self, ctx: &egui::Context, manual: bool) {
+        if self.updates.pending.is_some() {
+            return;
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(update::check());
+            ctx.request_repaint();
+        });
+        self.updates.pending = Some(rx);
+        self.updates.manual = manual;
+        if manual {
+            self.updates.error = None;
+        }
+    }
+
+    fn poll_updates(&mut self) {
+        let u = &mut self.updates;
+        if let Some(rx) = &u.pending {
+            let result = match rx.try_recv() {
+                Ok(r) => Some(r),
+                Err(TryRecvError::Empty) => None,
+                Err(TryRecvError::Disconnected) => Some(Err("The update check stopped.".into())),
+            };
+            if let Some(result) = result {
+                u.pending = None;
+                match result {
+                    Ok(update::Check::UpToDate) => {
+                        let now = format::unix_now();
+                        u.found = None;
+                        u.error = None;
+                        u.checked_at = Some(now);
+                        // Only "nothing new" is remembered: an available
+                        // update is checked (and shown) again next start.
+                        self.prefs.update_last_check = now;
+                    }
+                    Ok(update::Check::Available(release)) => {
+                        u.found = Some(release);
+                        u.error = None;
+                        u.checked_at = Some(format::unix_now());
+                    }
+                    Err(e) if u.manual => u.error = Some(e),
+                    Err(_) => {} // silent at startup
+                }
+            }
+        }
+        if let Some(rx) = &u.downloading {
+            let result = match rx.try_recv() {
+                Ok(r) => Some(r),
+                Err(TryRecvError::Empty) => None,
+                Err(TryRecvError::Disconnected) => Some(Err("The download stopped.".into())),
+            };
+            if let Some(result) = result {
+                u.downloading = None;
+                match result {
+                    Ok(path) => {
+                        update::reveal(&path);
+                        u.downloaded = Some(path);
+                    }
+                    Err(e) => u.download_error = Some(e),
+                }
+            }
+        }
+    }
+
+    fn start_update_download(&mut self, ctx: &egui::Context) {
+        let u = &mut self.updates;
+        let Some(asset) = u.found.as_ref().and_then(|r| r.asset.clone()) else {
+            return;
+        };
+        if u.downloading.is_some() {
+            return;
+        }
+        let Some(dir) = update::downloads_dir() else {
+            u.download_error = Some("Couldn't find the Downloads folder.".into());
+            return;
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(update::download(&asset, &dir));
+            ctx.request_repaint();
+        });
+        u.downloading = Some(rx);
+        u.downloaded = None;
+        u.download_error = None;
+    }
+
+    fn open_settings(&mut self, page: Category) {
+        self.settings_open = true;
+        self.settings_page = page;
+        self.settings_search.clear();
+        self.help_open = false;
+    }
+
+    /// Applies changed defaults to the current session right away.
+    fn apply_defaults(&mut self, before: Prefs, now: f64) {
+        let p = self.prefs;
+        if p.blink_seconds != before.blink_seconds {
+            self.set_speed(p.blink_seconds, now);
+        }
+        if p.show_stars != before.show_stars {
+            self.show_stars = p.show_stars;
+        }
+        if p.invert != before.invert {
+            self.invert = p.invert;
+        }
+        if p.grid_size != before.grid_size {
+            self.set_grid_size(p.grid_size);
         }
     }
 
@@ -424,6 +652,7 @@ impl App {
         if self.download.is_none() {
             self.download = Some(known::start_download(ctx));
             self.download_error = None;
+            self.download_note = None;
         }
     }
 
@@ -447,6 +676,7 @@ impl App {
         };
         self.known_focus = Some(i);
         let v = &mut self.view;
+        v.auto_fit = false;
         v.scale = v.scale.max(1.0);
         v.offset = v.stage / 2.0 - vec2(x as f32 + 0.5, h - 0.5 - y as f32) * v.scale;
     }
@@ -458,6 +688,22 @@ impl App {
         let scale = fit_scale(stage, w, h);
         self.view.scale = scale;
         self.view.offset = (stage - vec2(w, h) * scale) / 2.0;
+        self.view.auto_fit = true;
+    }
+
+    /// The stage changed size (side panel opened or closed, window
+    /// resized): fit again if the view is still as fitted, else keep the
+    /// image point at the centre where it is.
+    fn resize_stage(&mut self, size: Vec2) {
+        let old = std::mem::replace(&mut self.view.stage, size);
+        if !self.view.fitted || old.x <= 0.0 || old.y <= 0.0 {
+            return;
+        }
+        if self.view.auto_fit {
+            self.fit();
+        } else {
+            self.view.offset += (size - old) / 2.0;
+        }
     }
 
     /// Zooms by `factor` keeping the stage point `at` fixed (default: the centre).
@@ -465,6 +711,7 @@ impl App {
         let Some(f) = self.current() else { return };
         let min = fit_scale(self.view.stage, f.width as f32, f.height as f32) / 4.0;
         let v = &mut self.view;
+        v.auto_fit = false;
         let at = at.unwrap_or(v.stage / 2.0);
         let next = (v.scale * factor).clamp(min, MAX_SCALE);
         v.offset = at - (at - v.offset) * (next / v.scale);
@@ -663,6 +910,23 @@ impl App {
             self.index = n - 1;
         }
         self.settings_open = s.settings;
+        if let Some(page) = s.settings_page.as_deref().and_then(Category::from_key) {
+            self.settings_page = page;
+        }
+        self.settings_search = s.search.unwrap_or_default();
+        if let Some(version) = s.update {
+            // A made-up release, to see how an available update looks.
+            self.updates.found = Some(update::Release {
+                page: String::new(),
+                asset: update::platform_suffix().map(|suffix| update::Asset {
+                    name: format!("OpenCeres-{version}{suffix}"),
+                    url: String::new(),
+                    size: 7_900_000,
+                    sha256: None,
+                }),
+                version,
+            });
+        }
         self.help_open = s.help;
     }
 
@@ -700,6 +964,14 @@ impl App {
                             .on_hover_text("Report panel (Tab)");
                         if panel.clicked() {
                             self.prefs.panel_open = !self.prefs.panel_open;
+                        }
+                        if let Some(r) = &self.updates.found {
+                            ui.add_space(S1);
+                            let pill = update_pill(ui, &format!("Update {}", r.version))
+                                .on_hover_text("A new version of OpenCeres is available");
+                            if pill.clicked() {
+                                self.open_settings(Category::Updates);
+                            }
                         }
                         if self.set.is_some() {
                             ui.add_space(S4);
@@ -1036,7 +1308,9 @@ impl App {
     fn stage(&mut self, ui: &mut egui::Ui, frame: &eframe::Frame) {
         let rect = ui.available_rect_before_wrap();
         let response = ui.allocate_rect(rect, Sense::click_and_drag());
-        self.view.stage = rect.size();
+        if rect.size() != self.view.stage {
+            self.resize_stage(rect.size());
+        }
 
         if self.set.is_some() {
             ui.painter().rect_filled(rect, 0.0, theme::STAGE);
@@ -1088,7 +1362,10 @@ impl App {
             if let Some(pos) = pos {
                 let delta = pos - drag.start;
                 drag.moved |= delta.length() > CLICK_SLOP;
-                self.view.offset = drag.offset + delta;
+                if drag.moved {
+                    self.view.offset = drag.offset + delta;
+                    self.view.auto_fit = false;
+                }
                 if released && !drag.moved {
                     pick = Some(pos);
                 }
@@ -1303,6 +1580,24 @@ impl App {
                         .small()
                         .color(p.muted),
                 );
+                let mut open = false;
+                if k.source == KnownSource::Mpcorb && self.mpcorb_newer {
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = S1;
+                        ui.label(
+                            RichText::new("Newer catalogue available")
+                                .small()
+                                .color(p.accent),
+                        );
+                        open = ui
+                            .link(RichText::new("Update…").small().color(p.accent))
+                            .on_hover_text("Settings → Known objects")
+                            .clicked();
+                    });
+                }
+                if open {
+                    self.open_settings(Category::Known);
+                }
                 if let Some(i) = clicked {
                     self.focus_known(i);
                 }
@@ -1374,6 +1669,8 @@ impl App {
         }
         if let Some(e) = &self.download_error {
             ui.add(Label::new(RichText::new(e).small().color(p.danger)).wrap());
+        } else if let Some(note) = &self.download_note {
+            ui.add(Label::new(RichText::new(note).small().color(p.muted)).wrap());
         }
     }
 
@@ -1584,204 +1881,6 @@ impl App {
                     });
             });
     }
-
-    fn settings_window(&mut self, ctx: &egui::Context, now: f64) {
-        if !self.settings_open {
-            return;
-        }
-        let style = ctx.global_style();
-        let modal = egui::Modal::new(Id::new("settings"))
-            .frame(
-                Frame::popup(&style)
-                    .inner_margin(Margin::same(S5 as i8))
-                    .corner_radius(theme::RADIUS + 2),
-            )
-            .backdrop_color(Color32::from_black_alpha(70))
-            .show(ctx, |ui| {
-                let p = palette(ui);
-                let max_h = ui.ctx().content_rect().height() - 120.0;
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new("Settings").heading().color(p.text));
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if icons::small_button(ui, Icon::Close, p.muted)
-                            .on_hover_text("Close (Esc)")
-                            .clicked()
-                        {
-                            self.settings_open = false;
-                        }
-                    });
-                });
-                ui.add_space(S3);
-                egui::ScrollArea::vertical()
-                    .max_height(max_h.max(160.0))
-                    .show(ui, |ui| {
-                        ui.horizontal_top(|ui| {
-                            ui.spacing_mut().item_spacing.x = S5;
-                            ui.vertical(|ui| {
-                                ui.set_width(280.0);
-                                self.settings_controls(ui, now);
-                            });
-                            ui.vertical(|ui| {
-                                ui.set_width(280.0);
-                                settings_heading(ui, "Keyboard shortcuts");
-                                shortcut_table(ui, "settings_keys");
-                            });
-                        });
-                    });
-                ui.add_space(S4);
-                hline(ui, p.border);
-                ui.add_space(S3);
-                ui.horizontal(|ui| {
-                    if ui
-                        .button("Reset to defaults")
-                        .on_hover_text("Theme, blinking, display, grid and known-object defaults")
-                        .clicked()
-                    {
-                        let panel_open = self.prefs.panel_open;
-                        self.prefs = Prefs {
-                            panel_open,
-                            ..Prefs::default()
-                        };
-                        self.set_speed(self.prefs.blink_seconds, now);
-                        self.show_stars = self.prefs.show_stars;
-                        self.invert = self.prefs.invert;
-                        self.set_grid_size(self.prefs.grid_size);
-                    }
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if ui
-                            .add(Button::new("Done").min_size(vec2(72.0, 0.0)))
-                            .clicked()
-                        {
-                            self.settings_open = false;
-                        }
-                    });
-                });
-            });
-        if modal.should_close() {
-            self.settings_open = false;
-        }
-    }
-
-    fn settings_controls(&mut self, ui: &mut egui::Ui, now: f64) {
-        let p = palette(ui);
-        let row = |ui: &mut egui::Ui, label: &str| {
-            ui.allocate_ui_with_layout(
-                vec2(72.0, theme::TOOL),
-                Layout::left_to_right(Align::Center),
-                |ui| {
-                    ui.set_min_width(72.0);
-                    ui.label(RichText::new(label).color(p.text));
-                },
-            );
-        };
-        ui.spacing_mut().item_spacing.y = S2;
-
-        settings_heading(ui, "Appearance");
-        ui.horizontal(|ui| {
-            row(ui, "Theme");
-            let options: Vec<_> = ThemeChoice::ALL
-                .iter()
-                .map(|&t| (t, t.label().to_owned()))
-                .collect();
-            segmented(ui, &mut self.prefs.theme, &options, SETTING_WIDTH);
-        });
-
-        ui.add_space(S3);
-        settings_heading(ui, "Blinking");
-        ui.horizontal(|ui| {
-            row(ui, "Speed");
-            let mut secs = self.prefs.blink_seconds;
-            egui::ComboBox::from_id_salt("speed")
-                .width(SETTING_WIDTH - 2.0 * S2)
-                .selected_text(format!("{secs} s per frame"))
-                .show_ui(ui, |ui| {
-                    for s in SPEEDS {
-                        ui.selectable_value(&mut secs, s, format!("{s} s"));
-                    }
-                });
-            if secs != self.prefs.blink_seconds {
-                self.prefs.blink_seconds = secs;
-                self.set_speed(secs, now);
-            }
-        });
-
-        ui.add_space(S3);
-        settings_heading(ui, "Display");
-        ui.scope(|ui| {
-            // Square-ish, clearly outlined boxes: the shared radius would
-            // make them look like radio buttons.
-            let w = &mut ui.visuals_mut().widgets;
-            for state in [&mut w.inactive, &mut w.hovered, &mut w.active] {
-                state.corner_radius = egui::CornerRadius::same(3);
-            }
-            w.inactive.bg_stroke = Stroke::new(1.0, p.muted.gamma_multiply(0.7));
-            if ui
-                .checkbox(&mut self.prefs.show_stars, "Show detected stars")
-                .changed()
-            {
-                self.show_stars = self.prefs.show_stars;
-            }
-            if ui
-                .checkbox(&mut self.prefs.invert, "Invert (dark stars on white)")
-                .changed()
-            {
-                self.invert = self.prefs.invert;
-            }
-        });
-        muted_wrapped(ui, "Used when the app starts; S and I switch them for now.");
-
-        ui.add_space(S3);
-        settings_heading(ui, "Report grid");
-        ui.horizontal(|ui| {
-            row(ui, "Size");
-            let options: Vec<_> = GRID_SIZES
-                .iter()
-                .map(|&n| (n, format!("{n}×{n}")))
-                .collect();
-            if segmented(ui, &mut self.prefs.grid_size, &options, SETTING_WIDTH) {
-                self.set_grid_size(self.prefs.grid_size);
-            }
-        });
-        muted_wrapped(
-            ui,
-            "Boxes are named row × column, counted from the top-left.",
-        );
-
-        ui.add_space(S3);
-        settings_heading(ui, "Known objects");
-        ui.horizontal(|ui| {
-            row(ui, "Source");
-            let options: Vec<_> = KnownSource::ALL
-                .iter()
-                .map(|&k| (k, k.short().to_owned()))
-                .collect();
-            segmented(ui, &mut self.prefs.known_source, &options, SETTING_WIDTH);
-        });
-        muted_wrapped(
-            ui,
-            match self.prefs.known_source {
-                KnownSource::SkyBot => "Online: asks IMCCE's SkyBoT service; needs the internet.",
-                KnownSource::Mpcorb => {
-                    "Offline: searches the Minor Planet Center's catalogue on this \
-                     computer once it is downloaded."
-                }
-            },
-        );
-        let info = self.catalogue.get_or_insert_with(known::catalogue_info);
-        let status = match info {
-            Catalogue::Missing => "Not downloaded".to_owned(),
-            Catalogue::Present { date, bytes } => format!(
-                "{} · {:.0} MB",
-                date.as_deref().unwrap_or("Downloaded"),
-                *bytes as f64 / 1e6
-            ),
-        };
-        ui.horizontal(|ui| {
-            row(ui, "MPCORB");
-            ui.label(RichText::new(status).color(p.muted));
-        });
-        self.download_controls(ui);
-    }
 }
 
 impl eframe::App for App {
@@ -1791,6 +1890,9 @@ impl eframe::App for App {
         self.apply_theme(&ctx);
         self.poll_loading(now);
         self.poll_download();
+        self.poll_mpcorb_check();
+        self.poll_updates();
+        self.auto_checks(&ctx);
         if self.prefs.known_source != self.saved.known_source {
             self.known = None; // look up again from the new source
         }
@@ -2046,6 +2148,17 @@ fn segmented<T: Copy + PartialEq>(
     changed
 }
 
+/// The calm toolbar notice of an available update.
+fn update_pill(ui: &mut egui::Ui, text: &str) -> Response {
+    let p = palette(ui);
+    let button = Button::new(RichText::new(text).size(12.0).color(p.accent))
+        .fill(p.accent_weak)
+        .stroke(Stroke::NONE)
+        .corner_radius(11)
+        .min_size(vec2(0.0, 22.0));
+    ui.add(button).on_hover_cursor(CursorIcon::PointingHand)
+}
+
 fn section_heading(ui: &mut egui::Ui, title: &str, count: Option<usize>) {
     let p = palette(ui);
     ui.horizontal(|ui| {
@@ -2060,11 +2173,6 @@ fn section_heading(ui: &mut egui::Ui, title: &str, count: Option<usize>) {
                 });
         }
     });
-}
-
-fn settings_heading(ui: &mut egui::Ui, title: &str) {
-    let p = palette(ui);
-    ui.label(RichText::new(title).strong().color(p.text));
 }
 
 fn muted_wrapped(ui: &mut egui::Ui, text: &str) {
