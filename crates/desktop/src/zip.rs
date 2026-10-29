@@ -96,6 +96,11 @@ pub fn extract(zip: &[u8], entry: &Entry) -> Result<Vec<u8>, String> {
 }
 
 fn crc32(data: &[u8]) -> u32 {
+    crc32_update(0, data)
+}
+
+/// Continues a CRC-32 (IEEE, as in zip and gzip) over more data; start at 0.
+pub fn crc32_update(crc: u32, data: &[u8]) -> u32 {
     static TABLE: std::sync::OnceLock<[u32; 256]> = std::sync::OnceLock::new();
     let table = TABLE.get_or_init(|| {
         let mut t = [0u32; 256];
@@ -112,7 +117,7 @@ fn crc32(data: &[u8]) -> u32 {
         }
         t
     });
-    !data.iter().fold(!0u32, |c, &b| {
+    !data.iter().fold(!crc, |c, &b| {
         table[((c ^ b as u32) & 0xff) as usize] ^ (c >> 8)
     })
 }

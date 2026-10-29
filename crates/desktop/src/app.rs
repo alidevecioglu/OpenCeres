@@ -14,9 +14,11 @@ use crate::capture::{self, Capture};
 use crate::format;
 use crate::gpu::{Draw, Gpu};
 use crate::icons::{self, Icon};
+use crate::known::{self, Catalogue, Download, Lookup, LookupError};
 use crate::load::{self, Frame as ImageFrame, ImageSet};
-use crate::prefs::{GRID_SIZES, Prefs, SPEEDS, ThemeChoice};
+use crate::prefs::{GRID_SIZES, KnownSource, Prefs, SPEEDS, ThemeChoice};
 use crate::theme::{self, S1, S2, S3, S4, S5, palette};
+use openceres_core::known::KnownObject;
 
 const MAX_SCALE: f32 = 32.0;
 /// Pointer movement (points) that turns a click into a drag.
@@ -41,6 +43,29 @@ struct Set {
 struct Loading {
     message: String,
     rx: Receiver<Result<ImageSet, String>>,
+}
+
+/// Known objects for the open set: being looked up, found, or why not.
+enum KnownState {
+    Pending(Receiver<Result<Lookup, LookupError>>),
+    Done(KnownField),
+    /// The offline source is chosen but the catalogue is not downloaded.
+    NoCatalogue,
+    Failed(String),
+}
+
+struct KnownField {
+    /// Objects inside the image on at least one frame, brightest first.
+    objects: Vec<Placed>,
+    source: KnownSource,
+    at: String,
+    catalogue: Option<String>,
+}
+
+struct Placed {
+    object: KnownObject,
+    /// Position on each frame (0-based FITS pixels), `None` when outside.
+    at: Vec<Option<(f64, f64)>>,
 }
 
 #[derive(Default)]
@@ -77,9 +102,18 @@ pub struct App {
     invert: bool,
     grid_on: bool,
     grid_size: usize,
-    /// Marked report boxes as (column, row), 1-based from the top-left.
+    /// Marked report boxes as (row, column), 1-based from the top-left.
     marks: Vec<(usize, usize)>,
     copied: bool,
+    /// Known objects shown (session toggle, K).
+    known_on: bool,
+    known: Option<KnownState>,
+    /// Known object the view was last centred on (index into the list).
+    known_focus: Option<usize>,
+    download: Option<Download>,
+    download_error: Option<String>,
+    /// What Settings shows about the offline catalogue; `None` = read again.
+    catalogue: Option<Catalogue>,
     loading: Option<Loading>,
     error: Option<String>,
     view: View,
@@ -107,6 +141,7 @@ fn shortcuts() -> Vec<(Vec<String>, &'static str)> {
         (keys(&["S"]), "Detected stars"),
         (keys(&["I"]), "Invert"),
         (keys(&["G"]), "Report grid (click a box to mark it)"),
+        (keys(&["K"]), "Known objects in the field"),
         (keys(&["Tab"]), "Side panel (or \\)"),
         (vec!["O".into(), format!("{cmd}O")], "Open an image set"),
         (vec![format!("{cmd},")], "Settings"),
@@ -151,6 +186,12 @@ impl App {
             grid_size: prefs.grid_size,
             marks: Vec::new(),
             copied: false,
+            known_on: false,
+            known: None,
+            known_focus: None,
+            download: None,
+            download_error: None,
+            catalogue: None,
             loading: None,
             error: None,
             view: View::default(),
@@ -249,6 +290,8 @@ impl App {
                 });
                 self.marks.clear();
                 self.copied = false;
+                self.known = None;
+                self.known_focus = None;
                 self.index = 0;
                 self.playing = self.frame_count() > 1;
                 self.next_switch = now + self.period();
@@ -307,18 +350,105 @@ impl App {
         self.grid_size = n;
     }
 
-    /// e.g. `XY57_p01: 1x1 3x2`, boxes in reading order (row by row).
     fn report(&self) -> String {
-        let mut boxes = self.marks.clone();
-        boxes.sort_by_key(|&(c, r)| (r, c));
         let name = self
             .set
             .as_ref()
             .map(|s| s.name.as_str())
             .filter(|n| !n.is_empty())
             .unwrap_or("Image set");
-        let boxes: Vec<String> = boxes.iter().map(|(c, r)| format!("{c}x{r}")).collect();
-        format!("{name}: {}", boxes.join(" "))
+        report_line(name, &self.marks)
+    }
+
+    fn set_known(&mut self, on: bool) {
+        self.known_on = on;
+        if on {
+            self.prefs.panel_open = true;
+        }
+    }
+
+    /// Starts the lookup for the open set when known objects are on and it
+    /// has not been done yet (once per set and source).
+    fn ensure_known(&mut self, ctx: &egui::Context) {
+        if !self.known_on || self.known.is_some() {
+            return;
+        }
+        let Some(set) = &self.set else { return };
+        self.known = Some(match known::field(&set.frames) {
+            Ok(field) => KnownState::Pending(known::start(ctx, self.prefs.known_source, field)),
+            Err(e) => KnownState::Failed(e),
+        });
+    }
+
+    fn poll_known(&mut self) {
+        let Some(KnownState::Pending(rx)) = &self.known else {
+            return;
+        };
+        let result = match rx.try_recv() {
+            Ok(r) => r,
+            Err(TryRecvError::Empty) => return,
+            Err(TryRecvError::Disconnected) => Err(LookupError::Message(
+                "The lookup stopped unexpectedly.".into(),
+            )),
+        };
+        self.known = Some(match (result, &self.set) {
+            (Ok(lookup), Some(set)) => KnownState::Done(place(lookup, &set.frames)),
+            (Ok(_), None) => return self.known = None,
+            (Err(LookupError::NoCatalogue), _) => KnownState::NoCatalogue,
+            (Err(LookupError::Message(e)), _) => KnownState::Failed(e),
+        });
+    }
+
+    fn poll_download(&mut self) {
+        let Some(d) = &self.download else { return };
+        let result = match d.rx.try_recv() {
+            Ok(r) => r,
+            Err(TryRecvError::Empty) => return,
+            Err(TryRecvError::Disconnected) => Err("The download stopped unexpectedly.".into()),
+        };
+        self.download = None;
+        self.catalogue = None;
+        match result {
+            Ok(()) => {
+                self.download_error = None;
+                // Look up again with the new catalogue.
+                if self.prefs.known_source == KnownSource::Mpcorb {
+                    self.known = None;
+                }
+            }
+            Err(e) => self.download_error = Some(e),
+        }
+    }
+
+    fn start_download(&mut self, ctx: &egui::Context) {
+        if self.download.is_none() {
+            self.download = Some(known::start_download(ctx));
+            self.download_error = None;
+        }
+    }
+
+    /// Centres the view on known object `i` (on the current frame, else
+    /// wherever it is in the image), zooming in to at least 100 %.
+    fn focus_known(&mut self, i: usize) {
+        let Some(KnownState::Done(k)) = &self.known else {
+            return;
+        };
+        let Some(o) = k.objects.get(i) else { return };
+        let Some((x, y)) =
+            o.at.get(self.index)
+                .copied()
+                .flatten()
+                .or_else(|| o.at.iter().find_map(|p| *p))
+        else {
+            return;
+        };
+        let Some(h) = self.current().map(|f| f.height as f32) else {
+            return;
+        };
+        self.known_focus = Some(i);
+        let v = &mut self.view;
+        v.scale = v.scale.max(1.0);
+        v.offset = v.stage / 2.0 - vec2(x as f32 + 0.5, h - 0.5 - y as f32) * v.scale;
     }
 
     fn fit(&mut self) {
@@ -420,6 +550,7 @@ impl App {
                         "s" | "S" => self.show_stars = !self.show_stars,
                         "i" | "I" => self.invert = !self.invert,
                         "g" | "G" => self.set_grid(!self.grid_on),
+                        "k" | "K" => self.set_known(!self.known_on),
                         "," | "[" => self.change_speed(1, now),
                         "." | "]" => self.change_speed(-1, now),
                         "o" | "O" => self.choose(ctx, frame),
@@ -485,11 +616,22 @@ impl App {
             return;
         }
         ctx.request_repaint();
-        if self.loading.is_some() {
+        if self.loading.is_some() || matches!(self.known, Some(KnownState::Pending(_))) {
             return;
         }
         cap.frames += 1;
         let now = ctx.input(|i| i.time);
+        if cap.frames > CAPTURE_SETTLE
+            && let Some(label) = cap.focus.take()
+        {
+            cap.applied_at = Some(now);
+            if let Some(KnownState::Done(k)) = &self.known
+                && let Some(i) = k.objects.iter().position(|o| o.object.label() == label)
+            {
+                self.focus_known(i);
+            }
+            return;
+        }
         let settled = cap.applied_at.is_some_and(|t| now - t >= CAPTURE_WAIT);
         if cap.frames >= CAPTURE_SHOOT && settled && !cap.requested {
             cap.requested = true;
@@ -500,6 +642,10 @@ impl App {
         }
         cap.applied_at = Some(now);
         let s = std::mem::take(&mut cap.state);
+        cap.focus = s.focus;
+        if s.known {
+            self.set_known(true);
+        }
         self.show_stars |= s.stars;
         self.invert |= s.invert;
         if let Some(n) = s.grid_size.filter(|n| GRID_SIZES.contains(n)) {
@@ -664,8 +810,14 @@ impl App {
         }
     }
 
-    /// Stars, Invert, Grid toggles, added right to left.
+    /// Stars, Invert, Grid, Known toggles, added right to left.
     fn view_toggles(&mut self, ui: &mut egui::Ui) {
+        if icons::button(ui, Icon::Known, self.known_on, true)
+            .on_hover_text("Known asteroids and comets in the field (K)")
+            .clicked()
+        {
+            self.set_known(!self.known_on);
+        }
         if icons::button(ui, Icon::Grid, self.grid_on, true)
             .on_hover_text("Report grid (G)")
             .clicked()
@@ -746,6 +898,10 @@ impl App {
                             let zoom = (self.view.scale * 100.0).round();
                             ui.label(small(format!("{zoom}%")));
                             ui.label(small(format!("{} stars", thousands(f.stars.len()))));
+                            if matches!(self.known, Some(KnownState::Pending(_))) {
+                                ui.label(small("Looking up known objects…".into()));
+                                ui.add(egui::Spinner::new().size(11.0).color(p.muted));
+                            }
                         });
                     }
                 });
@@ -771,6 +927,17 @@ impl App {
                 let count = (!self.marks.is_empty()).then_some(self.marks.len());
                 section_heading(ui, "Easy report", count);
                 self.report_section(ui);
+                if self.known_on {
+                    ui.add_space(S3);
+                    hline(ui, p.border);
+                    ui.add_space(S2);
+                    let count = match &self.known {
+                        Some(KnownState::Done(k)) => Some(k.objects.len()),
+                        _ => None,
+                    };
+                    section_heading(ui, "Known objects", count);
+                    self.known_section(ui);
+                }
                 ui.add_space(S3);
                 hline(ui, p.border);
                 ui.add_space(S2);
@@ -795,7 +962,8 @@ impl App {
         if !self.grid_on {
             muted_wrapped(
                 ui,
-                "Turn on the grid, then click each box where something moves.",
+                "Turn on the grid, then click each box where something moves. Boxes are \
+                 named row × column, counted from the top-left.",
             );
             let show = ui
                 .add_enabled(loaded, Button::new("Show grid"))
@@ -1003,15 +1171,217 @@ impl App {
         if self.grid_on {
             self.paint_grid(&painter, image);
         }
+        if self.known_on {
+            self.paint_known(&painter, rect, origin, h);
+        }
+    }
+
+    /// A ring (at least 6″ across the radius) and a `133105 · 19.0` chip for
+    /// each known object on the current frame. Labels that would overlap an
+    /// earlier (brighter) one are left out, and all of them when zoomed far out.
+    fn paint_known(&self, painter: &egui::Painter, rect: Rect, origin: Pos2, h: f32) {
+        let (Some(KnownState::Done(k)), Some(f)) = (&self.known, self.current()) else {
+            return;
+        };
+        let scale = self.view.scale;
+        let arcsec = f.wcs.as_ref().map_or(0.25, |w| w.pixel_scale()) as f32;
+        let r = (6.0 / arcsec * scale).max(10.0);
+        let font = FontId::proportional(11.5);
+        let labels = scale >= 0.1;
+        let mut taken: Vec<Rect> = Vec::new();
+        let visible = rect.expand(r + 4.0);
+        // The focused object last, so its ring and label are on top.
+        let order = (0..k.objects.len())
+            .filter(|&i| Some(i) != self.known_focus)
+            .chain(self.known_focus);
+        let mut chips = Vec::new();
+        for i in order {
+            let Some(o) = k.objects.get(i) else { continue };
+            let Some((x, y)) = o.at.get(self.index).copied().flatten() else {
+                continue;
+            };
+            let c = origin + vec2(x as f32 + 0.5, h - 0.5 - y as f32) * scale;
+            if !visible.contains(c) {
+                continue;
+            }
+            let focused = Some(i) == self.known_focus;
+            let width = if focused { 2.25 } else { 1.5 };
+            painter.circle_stroke(c, r, Stroke::new(width + 2.0, theme::KNOWN_HALO));
+            painter.circle_stroke(c, r, Stroke::new(width, theme::KNOWN));
+            if labels {
+                chips.push((c, known_chip_text(&o.object), focused));
+            }
+        }
+        // Labels after all rings, focused one first so it always shows.
+        chips.sort_by_key(|&(_, _, focused)| !focused);
+        for (c, text, _) in chips {
+            let galley = painter.layout_no_wrap(text, font.clone(), theme::KNOWN_TEXT);
+            // Up and right of the ring, flipped where that leaves the stage.
+            let d = r * std::f32::consts::FRAC_1_SQRT_2;
+            let size = vec2(galley.size().x + S2, 17.0);
+            let mut min = c + vec2(d + 2.0, -d - 15.0);
+            if min.x + size.x > rect.max.x {
+                min.x = c.x - d - 2.0 - size.x;
+            }
+            if min.y < rect.min.y {
+                min.y = c.y + d - 2.0;
+            }
+            let chip = Rect::from_min_size(min, size);
+            if taken.iter().any(|t| t.intersects(chip)) {
+                continue;
+            }
+            taken.push(chip);
+            painter.rect_filled(chip, 3.0, theme::GRID_CHIP);
+            let at = pos2(chip.min.x + S1, chip.center().y - galley.size().y / 2.0);
+            painter.galley(at, galley, theme::KNOWN_TEXT);
+        }
+    }
+
+    fn known_section(&mut self, ui: &mut egui::Ui) {
+        let p = palette(ui);
+        if self.set.is_none() {
+            muted_wrapped(ui, "Open an image set first.");
+            return;
+        }
+        match &self.known {
+            None | Some(KnownState::Pending(_)) => {
+                ui.horizontal(|ui| {
+                    ui.add(egui::Spinner::new().size(13.0).color(p.muted));
+                    ui.label(RichText::new("Looking up known objects…").color(p.muted));
+                });
+            }
+            Some(KnownState::Failed(e)) => {
+                ui.add(Label::new(RichText::new(e).color(p.danger)).wrap());
+                if ui.button("Try again").clicked() {
+                    self.known = None;
+                }
+            }
+            Some(KnownState::NoCatalogue) => {
+                muted_wrapped(
+                    ui,
+                    "The offline MPCORB catalogue isn't on this computer yet. Download it \
+                     once (about 94 MB), or use SkyBoT online.",
+                );
+                self.download_controls(ui);
+                if self.download.is_none()
+                    && ui
+                        .button("Use SkyBoT instead")
+                        .on_hover_text("Changes the source in Settings")
+                        .clicked()
+                {
+                    self.prefs.known_source = KnownSource::SkyBot;
+                }
+            }
+            Some(KnownState::Done(k)) => {
+                let mut clicked = None;
+                if k.objects.is_empty() {
+                    muted_wrapped(ui, "No known asteroids or comets in this field.");
+                } else {
+                    let max = (ui.available_height() - 120.0).max(120.0);
+                    egui::ScrollArea::vertical()
+                        .id_salt("known_list")
+                        .max_height(max)
+                        .show(ui, |ui| {
+                            ui.spacing_mut().item_spacing.y = 0.0;
+                            for (i, o) in k.objects.iter().enumerate() {
+                                let here = o.at.get(self.index).copied().flatten();
+                                let detail = self.known_detail(&o.object, here);
+                                let selected = self.known_focus == Some(i);
+                                if known_row(ui, &o.object, &detail, selected).clicked() {
+                                    clicked = Some(i);
+                                }
+                            }
+                        });
+                }
+                let source = match (&k.source, &k.catalogue) {
+                    (KnownSource::Mpcorb, Some(date)) => format!("MPCORB of {date}"),
+                    (s, _) => s.short().to_owned(),
+                };
+                ui.add_space(S1);
+                ui.label(
+                    RichText::new(format!("{source} · looked up {}", k.at))
+                        .small()
+                        .color(p.muted),
+                );
+                if let Some(i) = clicked {
+                    self.focus_known(i);
+                }
+            }
+        }
+    }
+
+    /// `MB>Inner · 0.64″/min · box 3x2` for a list row.
+    fn known_detail(&self, o: &KnownObject, here: Option<(f64, f64)>) -> String {
+        let rate = o.motion_ra.hypot(o.motion_dec) / 60.0;
+        let mut parts = vec![o.class.clone(), format!("{rate:.2}″/min")];
+        match (here, self.current()) {
+            (Some((x, y)), Some(f)) if self.grid_on => {
+                let (w, h) = (f.width as f32, f.height as f32);
+                let u = (x as f32 + 0.5) / w;
+                let v = (h - 0.5 - y as f32) / h;
+                parts.push(format!("box {}", box_label(grid_box(u, v, self.grid_size))));
+            }
+            (None, _) => parts.push("not on this frame".into()),
+            _ => {}
+        }
+        parts.join(" · ")
+    }
+
+    /// Download button, or progress with a Cancel button while downloading.
+    fn download_controls(&mut self, ui: &mut egui::Ui) {
+        let p = palette(ui);
+        if let Some(d) = &self.download {
+            use std::sync::atomic::Ordering::Relaxed;
+            let mb = |b: u64| b as f64 / 1e6;
+            let (got, total) = (d.received.load(Relaxed), d.total.load(Relaxed));
+            let mut cancel = false;
+            ui.horizontal(|ui| {
+                let w = (ui.available_width() - 72.0).max(80.0);
+                if d.checking.load(Relaxed) {
+                    ui.add(egui::Spinner::new().size(13.0).color(p.muted));
+                    ui.label(RichText::new("Checking the download…").color(p.muted));
+                } else if total > 0 {
+                    let frac = (got as f32 / total as f32).clamp(0.0, 1.0);
+                    ui.add(egui::ProgressBar::new(frac).desired_width(w).text(format!(
+                        "{:.0} of {:.0} MB",
+                        mb(got),
+                        mb(total)
+                    )));
+                } else {
+                    ui.add(egui::Spinner::new().size(13.0).color(p.muted));
+                    ui.label(RichText::new(format!("{:.0} MB", mb(got))).color(p.muted));
+                }
+                cancel = ui.button("Cancel").clicked();
+            });
+            if cancel {
+                d.cancel();
+            }
+        } else {
+            let label = if matches!(self.catalogue, Some(Catalogue::Present { .. })) {
+                "Update MPCORB"
+            } else {
+                "Download MPCORB"
+            };
+            if ui
+                .button(label)
+                .on_hover_text(
+                    "Download the latest catalogue from the Minor Planet Center (~94 MB)",
+                )
+                .clicked()
+            {
+                self.start_download(ui.ctx());
+            }
+        }
+        if let Some(e) = &self.download_error {
+            ui.add(Label::new(RichText::new(e).small().color(p.danger)).wrap());
+        }
     }
 
     fn toggle_mark(&mut self, u: f32, v: f32) {
         if !self.grid_on {
             return;
         }
-        let n = self.grid_size;
-        let cell = |t: f32| ((t * n as f32).floor() as usize + 1).min(n);
-        let key = (cell(u), cell(v));
+        let key = grid_box(u, v, self.grid_size);
         if let Some(i) = self.marks.iter().position(|&m| m == key) {
             self.marks.remove(i);
         } else {
@@ -1023,7 +1393,7 @@ impl App {
     fn paint_grid(&self, painter: &egui::Painter, image: Rect) {
         let n = self.grid_size;
         let cell = image.size() / n as f32;
-        for &(c, r) in &self.marks {
+        for &(r, c) in &self.marks {
             let min = image.min + vec2((c - 1) as f32 * cell.x, (r - 1) as f32 * cell.y);
             painter.rect_filled(Rect::from_min_size(min, cell), 0.0, theme::GRID_FILL);
         }
@@ -1046,7 +1416,7 @@ impl App {
                         (r - 1) as f32 * cell.y + S1 + 1.0,
                     );
                 let galley =
-                    painter.layout_no_wrap(format!("{c}x{r}"), font.clone(), theme::GRID_TEXT);
+                    painter.layout_no_wrap(box_label((r, c)), font.clone(), theme::GRID_TEXT);
                 let chip = Rect::from_min_size(at, vec2(galley.size().x + S2, 17.0));
                 painter.rect_filled(chip, 3.0, theme::GRID_CHIP);
                 let text_at = pos2(at.x + S1, chip.center().y - galley.size().y / 2.0);
@@ -1264,7 +1634,7 @@ impl App {
                 ui.horizontal(|ui| {
                     if ui
                         .button("Reset to defaults")
-                        .on_hover_text("Theme, blinking, display and grid defaults")
+                        .on_hover_text("Theme, blinking, display, grid and known-object defaults")
                         .clicked()
                     {
                         let panel_open = self.prefs.panel_open;
@@ -1372,6 +1742,45 @@ impl App {
                 self.set_grid_size(self.prefs.grid_size);
             }
         });
+        muted_wrapped(
+            ui,
+            "Boxes are named row × column, counted from the top-left.",
+        );
+
+        ui.add_space(S3);
+        settings_heading(ui, "Known objects");
+        ui.horizontal(|ui| {
+            row(ui, "Source");
+            let options: Vec<_> = KnownSource::ALL
+                .iter()
+                .map(|&k| (k, k.short().to_owned()))
+                .collect();
+            segmented(ui, &mut self.prefs.known_source, &options, SETTING_WIDTH);
+        });
+        muted_wrapped(
+            ui,
+            match self.prefs.known_source {
+                KnownSource::SkyBot => "Online: asks IMCCE's SkyBoT service; needs the internet.",
+                KnownSource::Mpcorb => {
+                    "Offline: searches the Minor Planet Center's catalogue on this \
+                     computer once it is downloaded."
+                }
+            },
+        );
+        let info = self.catalogue.get_or_insert_with(known::catalogue_info);
+        let status = match info {
+            Catalogue::Missing => "Not downloaded".to_owned(),
+            Catalogue::Present { date, bytes } => format!(
+                "{} · {:.0} MB",
+                date.as_deref().unwrap_or("Downloaded"),
+                *bytes as f64 / 1e6
+            ),
+        };
+        ui.horizontal(|ui| {
+            row(ui, "MPCORB");
+            ui.label(RichText::new(status).color(p.muted));
+        });
+        self.download_controls(ui);
     }
 }
 
@@ -1381,6 +1790,12 @@ impl eframe::App for App {
         let now = ctx.input(|i| i.time);
         self.apply_theme(&ctx);
         self.poll_loading(now);
+        self.poll_download();
+        if self.prefs.known_source != self.saved.known_source {
+            self.known = None; // look up again from the new source
+        }
+        self.poll_known();
+        self.ensure_known(&ctx);
         self.drive_capture(&ctx);
         if let Some(e) = self.gpu.take_error() {
             self.error = Some(e);
@@ -1447,6 +1862,120 @@ fn summary(frames: &[ImageFrame]) -> String {
         parts.push(format!("{:.1} min", (max - min) * 1440.0));
     }
     parts.join("  ·  ")
+}
+
+/// Places the objects of a lookup on each frame (at that frame's
+/// mid-exposure time) and keeps those inside the image, brightest first.
+fn place(lookup: Lookup, frames: &[ImageFrame]) -> KnownField {
+    let epoch = lookup.epoch;
+    let mut objects: Vec<Placed> = lookup
+        .objects
+        .into_iter()
+        .filter_map(|object| {
+            let at: Vec<_> = frames
+                .iter()
+                .map(|f| {
+                    let (ra, dec) = object.position_at(epoch, f.mid_jd.unwrap_or(epoch));
+                    let (x, y) = f.wcs.as_ref()?.sky_to_pixel(ra, dec)?;
+                    let (w, h) = (f.width as f64 - 0.5, f.height as f64 - 0.5);
+                    (x >= -0.5 && y >= -0.5 && x < w && y < h).then_some((x, y))
+                })
+                .collect();
+            at.iter()
+                .any(Option::is_some)
+                .then_some(Placed { object, at })
+        })
+        .collect();
+    objects.sort_by(|a, b| {
+        let m = |o: &Placed| o.object.magnitude.unwrap_or(f64::INFINITY);
+        m(a).total_cmp(&m(b))
+    });
+    KnownField {
+        objects,
+        source: lookup.source,
+        at: lookup.at,
+        catalogue: lookup.catalogue,
+    }
+}
+
+/// `133105 · 19.0`, the label drawn next to a known object.
+fn known_chip_text(o: &KnownObject) -> String {
+    match o.magnitude {
+        Some(m) => format!("{} · {m:.1}", o.label()),
+        None => o.label().to_owned(),
+    }
+}
+
+/// One clickable list row: label (and name), magnitude, then details.
+fn known_row(ui: &mut egui::Ui, o: &KnownObject, detail: &str, selected: bool) -> Response {
+    let p = palette(ui);
+    let (rect, response) = ui.allocate_exact_size(vec2(ui.available_width(), 40.0), Sense::click());
+    let painter = ui.painter();
+    if selected {
+        painter.rect_filled(rect, theme::RADIUS, p.accent_weak);
+    } else if response.hovered() {
+        painter.rect_filled(rect, theme::RADIUS, p.hover);
+    }
+    let inner = rect.shrink2(vec2(S2, S1 + 1.0));
+    let one_line = |job: &mut LayoutJob, width: f32| {
+        job.wrap = egui::text::TextWrapping {
+            max_width: width,
+            max_rows: 1,
+            break_anywhere: true,
+            overflow_character: Some('…'),
+        };
+    };
+    let format = |size: f32, color: Color32| TextFormat {
+        font_id: FontId::proportional(size),
+        color,
+        ..Default::default()
+    };
+    let mag = o.magnitude.map(|m| format!("{m:.1}")).unwrap_or_default();
+    let mag = painter.layout_no_wrap(mag, FontId::proportional(13.0), p.text);
+    let mut title = LayoutJob::default();
+    title.append(o.label(), 0.0, format(13.0, p.text));
+    if o.number.is_some() {
+        title.append(&o.name, S2, format(12.0, p.muted));
+    }
+    one_line(&mut title, inner.width() - mag.size().x - S2);
+    let mut sub = LayoutJob::default();
+    sub.append(detail, 0.0, format(11.5, p.muted));
+    one_line(&mut sub, inner.width());
+    let title = painter.layout_job(title);
+    let sub = painter.layout_job(sub);
+    painter.galley(pos2(inner.max.x - mag.size().x, inner.min.y), mag, p.text);
+    painter.galley(inner.min, title, p.text);
+    painter.galley(pos2(inner.min.x, inner.max.y - sub.size().y), sub, p.muted);
+    let tip = format!(
+        "{}{} — click to centre on it",
+        o.name,
+        o.number
+            .as_deref()
+            .map_or_else(String::new, |n| format!(" ({n})"))
+    );
+    response
+        .on_hover_cursor(CursorIcon::PointingHand)
+        .on_hover_text(tip)
+}
+
+/// Report box (row, column), 1-based from the top-left, holding the point
+/// at fractions `u` across and `v` down the displayed image.
+fn grid_box(u: f32, v: f32, n: usize) -> (usize, usize) {
+    let cell = |t: f32| ((t.max(0.0) * n as f32).floor() as usize + 1).min(n);
+    (cell(v), cell(u))
+}
+
+/// The team's box name: row × column, e.g. `1x2` = top row, second column.
+fn box_label((row, col): (usize, usize)) -> String {
+    format!("{row}x{col}")
+}
+
+/// e.g. `XY57_p01: 1x2 2x1`, boxes in reading order (by row, then column).
+fn report_line(name: &str, marks: &[(usize, usize)]) -> String {
+    let mut boxes = marks.to_vec();
+    boxes.sort_unstable();
+    let boxes: Vec<String> = boxes.into_iter().map(box_label).collect();
+    format!("{name}: {}", boxes.join(" "))
 }
 
 fn command_key(key: &str) -> String {
@@ -1603,6 +2132,16 @@ fn paint_logo(ui: &egui::Ui, rect: Rect) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn boxes_are_row_by_column() {
+        // Top row, second column of a 4×4 grid.
+        assert_eq!(box_label(grid_box(0.3, 0.1, 4)), "1x2");
+        assert_eq!(box_label(grid_box(0.1, 0.3, 4)), "2x1");
+        assert_eq!(box_label(grid_box(1.0, 1.0, 4)), "4x4");
+        let marks = [grid_box(0.1, 0.3, 4), grid_box(0.3, 0.1, 4)];
+        assert_eq!(report_line("XY57_p01", &marks), "XY57_p01: 1x2 2x1");
+    }
 
     #[test]
     fn groups_thousands() {

@@ -41,6 +41,34 @@ impl ThemeChoice {
     }
 }
 
+/// Where known objects come from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum KnownSource {
+    /// IMCCE's SkyBoT web service.
+    #[default]
+    SkyBot,
+    /// The MPC's MPCORB catalogue, downloaded into the data folder.
+    Mpcorb,
+}
+
+impl KnownSource {
+    pub const ALL: [KnownSource; 2] = [KnownSource::SkyBot, KnownSource::Mpcorb];
+
+    pub fn short(self) -> &'static str {
+        match self {
+            KnownSource::SkyBot => "SkyBoT",
+            KnownSource::Mpcorb => "MPCORB",
+        }
+    }
+
+    fn key(self) -> &'static str {
+        match self {
+            KnownSource::SkyBot => "skybot",
+            KnownSource::Mpcorb => "mpcorb",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Prefs {
     pub theme: ThemeChoice,
@@ -50,6 +78,7 @@ pub struct Prefs {
     pub grid_size: usize,
     /// Whether the report side panel is open.
     pub panel_open: bool,
+    pub known_source: KnownSource,
 }
 
 impl Default for Prefs {
@@ -61,6 +90,7 @@ impl Default for Prefs {
             invert: false,
             grid_size: 4,
             panel_open: false,
+            known_source: KnownSource::SkyBot,
         }
     }
 }
@@ -93,6 +123,11 @@ impl Prefs {
                     }
                 }
                 "panel_open" => p.panel_open = flag(p.panel_open),
+                "known_source" => {
+                    if let Some(k) = KnownSource::ALL.into_iter().find(|k| k.key() == value) {
+                        p.known_source = k;
+                    }
+                }
                 _ => {}
             }
         }
@@ -101,13 +136,15 @@ impl Prefs {
 
     pub fn to_text(self) -> String {
         format!(
-            "theme={}\nblink_seconds={}\nshow_stars={}\ninvert={}\ngrid_size={}\npanel_open={}\n",
+            "theme={}\nblink_seconds={}\nshow_stars={}\ninvert={}\ngrid_size={}\npanel_open={}\n\
+             known_source={}\n",
             self.theme.key(),
             self.blink_seconds,
             self.show_stars,
             self.invert,
             self.grid_size,
-            self.panel_open
+            self.panel_open,
+            self.known_source.key()
         )
     }
 
@@ -141,8 +178,10 @@ fn env_dir(key: &str) -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
-fn path() -> Option<PathBuf> {
-    let dir = if cfg!(target_os = "macos") {
+/// The app's own folder for preferences and the offline catalogue, e.g.
+/// `~/Library/Application Support/OpenCeres` on macOS.
+pub fn data_dir() -> Option<PathBuf> {
+    Some(if cfg!(target_os = "macos") {
         env_dir("HOME")?.join("Library/Application Support/OpenCeres")
     } else if cfg!(windows) {
         env_dir("APPDATA")?.join("OpenCeres")
@@ -150,8 +189,11 @@ fn path() -> Option<PathBuf> {
         env_dir("XDG_CONFIG_HOME")
             .or_else(|| env_dir("HOME").map(|h| h.join(".config")))?
             .join("openceres")
-    };
-    Some(dir.join("prefs.txt"))
+    })
+}
+
+fn path() -> Option<PathBuf> {
+    data_dir().map(|d| d.join("prefs.txt"))
 }
 
 #[cfg(test)]
@@ -167,6 +209,7 @@ mod tests {
             invert: true,
             grid_size: 6,
             panel_open: true,
+            known_source: KnownSource::Mpcorb,
         };
         assert_eq!(Prefs::parse(&p.to_text()), p);
     }

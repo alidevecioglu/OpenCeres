@@ -4,7 +4,7 @@
 
 use std::path::Path;
 
-use openceres_core::{detect, fits, render, time, wcs::Wcs};
+use openceres_core::{detect, fits, known, render, time, wcs::Wcs};
 
 use crate::zip;
 
@@ -23,7 +23,8 @@ pub struct StarMark {
 }
 
 /// One processed frame. The raw pixel data is not kept: only the display
-/// bytes (until they are uploaded to the GPU), the stars and the WCS.
+/// bytes (until they are uploaded to the GPU), the stars, the WCS and the
+/// few header values the app needs.
 pub struct Frame {
     pub width: usize,
     pub height: usize,
@@ -35,6 +36,10 @@ pub struct Frame {
     pub mjd_obs: Option<f64>,
     /// Julian Date of the exposure start, for ordering and the time span.
     pub jd: Option<f64>,
+    /// Julian Date of the middle of the exposure, for known-object positions.
+    pub mid_jd: Option<f64>,
+    /// MPC observatory code, if the telescope is recognised.
+    pub observatory: Option<&'static str>,
     pub filter: Option<String>,
     name: String,
 }
@@ -168,6 +173,8 @@ fn load(source: Source) -> Result<Frame, String> {
         date_obs,
         mjd_obs,
         jd,
+        mid_jd: time::mid_exposure_jd(h),
+        observatory: known::observatory_code(h),
         filter: h.text("FILTER").map(str::to_owned),
         name,
     })

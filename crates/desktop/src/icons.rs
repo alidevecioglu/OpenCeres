@@ -19,6 +19,7 @@ pub enum Icon {
     Stars,
     Invert,
     Grid,
+    Known,
     Sidebar,
     Gear,
     Close,
@@ -92,6 +93,18 @@ pub fn paint(painter: &egui::Painter, rect: Rect, icon: Icon, color: Color32) {
                     Stroke::new(1.0, color),
                 );
             }
+        }
+        Icon::Known => {
+            // A tilted orbit with an asteroid on it, around a small sun.
+            let (cos, sin) = ((-0.45f32).cos(), (-0.45f32).sin());
+            let orbit = |t: f32| {
+                let (x, y) = (7.0 * t.cos(), 4.25 * t.sin());
+                at(x * cos - y * sin, x * sin + y * cos)
+            };
+            let ring: Vec<Pos2> = (0..=40).map(|i| orbit(i as f32 / 40.0 * TAU)).collect();
+            painter.add(Shape::line(ring, Stroke::new(1.25, color)));
+            painter.circle_filled(c, 1.5 * s, color);
+            painter.circle_filled(orbit(0.9), 2.75 * s, color);
         }
         Icon::Sidebar => {
             let r = Rect::from_center_size(c, vec2(14.0, 12.0) * s);

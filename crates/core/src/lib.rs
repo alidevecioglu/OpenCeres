@@ -6,8 +6,11 @@
 //! (0, 0); the conversion happens only inside [`wcs`].
 
 pub mod detect;
+pub mod ephem;
 pub mod fits;
+pub mod known;
 pub mod mpc;
+pub mod orbit;
 pub mod render;
 pub mod time;
 pub mod wcs;

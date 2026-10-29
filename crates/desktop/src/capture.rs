@@ -12,8 +12,10 @@
 //! until they have loaded and a few frames have been drawn, saves a PNG of
 //! its own window and exits. `OPENCERES_SCREENSHOT_STATE` is a comma list of:
 //! `light`, `dark`, `stars`, `invert`, `grid`, `panel`, `settings`, `help`,
-//! `paused`, `frame=N` (1-based), `mark=CxR` (repeatable), `gridsize=N` and
-//! `size=WxH` (window size in points).
+//! `paused`, `frame=N` (1-based), `mark=RxC` (row × column, repeatable),
+//! `gridsize=N`, `known` (look up known objects and wait for the answer),
+//! `focus=LABEL` (centre and zoom on that known object) and `size=WxH`
+//! (window size in points).
 
 use eframe::egui;
 
@@ -27,8 +29,11 @@ pub struct State {
     pub settings: bool,
     pub help: bool,
     pub paused: bool,
+    pub known: bool,
+    pub focus: Option<String>,
     pub frame: Option<usize>,
     pub grid_size: Option<usize>,
+    /// Report boxes as (row, column).
     pub marks: Vec<(usize, usize)>,
     pub size: Option<[f32; 2]>,
 }
@@ -42,6 +47,8 @@ pub struct Capture {
     /// before the shot.
     pub applied_at: Option<f64>,
     pub requested: bool,
+    /// Known object to centre on once the lookup has finished.
+    pub focus: Option<String>,
 }
 
 impl Capture {
@@ -56,6 +63,7 @@ impl Capture {
             frames: 0,
             applied_at: None,
             requested: false,
+            focus: None,
         })
     }
 }
@@ -79,6 +87,8 @@ impl State {
                 "settings" => s.settings = true,
                 "help" => s.help = true,
                 "paused" => s.paused = true,
+                "known" => s.known = true,
+                "focus" => s.focus = Some(value.to_owned()).filter(|v| !v.is_empty()),
                 "frame" => s.frame = value.parse().ok(),
                 "gridsize" => s.grid_size = value.parse().ok(),
                 "mark" => s.marks.extend(pair(value)),
@@ -167,11 +177,15 @@ mod tests {
 
     #[test]
     fn parses_state() {
-        let s = State::parse("dark, grid,mark=2x1,mark=3x4,size=900x600,frame=2,bogus");
+        let s = State::parse(
+            "dark, grid,mark=2x1,mark=3x4,size=900x600,frame=2,known,focus=2026 RA34,bogus",
+        );
         assert_eq!(s.theme, Some(egui::Theme::Dark));
         assert!(s.grid && !s.panel);
         assert_eq!(s.marks, [(2, 1), (3, 4)]);
         assert_eq!(s.size, Some([900.0, 600.0]));
         assert_eq!(s.frame, Some(2));
+        assert!(s.known);
+        assert_eq!(s.focus.as_deref(), Some("2026 RA34"));
     }
 }

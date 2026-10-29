@@ -1,8 +1,8 @@
 //! Colours, spacing and widget styling for the light and dark themes.
 //!
 //! One spacing scale (4/8/12/16/24), one corner radius, calm neutral
-//! surfaces, a single blue accent for primary and selected state, and amber
-//! only for the report grid. The image stage is dark in both themes.
+//! surfaces, a single blue accent for primary and selected state, amber
+//! only for the report grid and teal-green only for known objects. The image stage is dark in both themes.
 
 use eframe::egui::{
     self, Color32, CornerRadius, FontDefinitions, FontFamily, FontId, Stroke, TextStyle, Theme,
@@ -88,6 +88,12 @@ pub const GRID_LINE: Color32 = Color32::from_rgba_premultiplied(204, 141, 26, 20
 pub const GRID_FILL: Color32 = Color32::from_rgba_premultiplied(71, 49, 9, 71); // rgba(255,176,32,.28)
 pub const GRID_CHIP: Color32 = Color32::from_rgba_premultiplied(13, 15, 19, 184); // rgba(18,21,27,.72)
 pub const GRID_TEXT: Color32 = rgb(0xffc04d);
+/// Known-object rings and labels: teal-green, apart from the blue star
+/// rings and the amber grid, with a dark halo so they read on an inverted
+/// (white) image too.
+pub const KNOWN: Color32 = rgb(0x3ddc97);
+pub const KNOWN_HALO: Color32 = Color32::from_rgba_premultiplied(0, 0, 0, 150);
+pub const KNOWN_TEXT: Color32 = rgb(0x7af0bd);
 pub const OVERLAY_TEXT: Color32 = rgb(0xf1f3f6);
 
 pub fn palette(ui: &egui::Ui) -> &'static Palette {
