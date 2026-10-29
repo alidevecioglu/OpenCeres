@@ -1,0 +1,144 @@
+# Checks every push and pull request, builds the desktop app for macOS,
+# Linux and Windows, and publishes a GitHub Release for version tags (v*).
+name: Build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  RUST_VERSION: "1.98.1"
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: Format, lint, test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        run: |
+          rustup toolchain install "$RUST_VERSION" --profile minimal --component rustfmt,clippy
+          rustup default "$RUST_VERSION"
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: check-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - run: cargo test --workspace --locked
+
+  build:
+    name: Build (${{ matrix.name }})
+    needs: check
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macOS
+            os: macos-latest
+          - name: Linux
+            os: ubuntu-latest
+          - name: Windows
+            os: windows-latest
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Version
+        id: version
+        shell: bash
+        run: echo "value=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)" >> "$GITHUB_OUTPUT"
+
+      # macOS uses the repo's ./mac script, which installs its own Rust
+      # toolchain into .cache/ and assembles the .app bundle.
+      - name: Install Rust
+        if: runner.os != 'macOS'
+        shell: bash
+        run: |
+          rustup toolchain install "$RUST_VERSION" --profile minimal
+          rustup default "$RUST_VERSION"
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            .cache/macos-toolchain
+            target
+          key: build-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+
+      - name: Build macOS app (Apple Silicon + Intel)
+        if: runner.os == 'macOS'
+        env:
+          OPENCERES_UNIVERSAL: "1"
+        run: |
+          ./mac dmg
+          cd target/macos/release
+          ditto -c -k --keepParent OpenCeres.app "OpenCeres-${{ steps.version.outputs.value }}-macos.zip"
+          mkdir -p "$GITHUB_WORKSPACE/dist"
+          mv "OpenCeres-${{ steps.version.outputs.value }}.dmg" "$GITHUB_WORKSPACE/dist/OpenCeres-${{ steps.version.outputs.value }}-macos.dmg"
+          mv "OpenCeres-${{ steps.version.outputs.value }}-macos.zip" "$GITHUB_WORKSPACE/dist/"
+
+      - name: Build Linux app
+        if: runner.os == 'Linux'
+        run: |
+          cargo build --release --locked -p openceres-desktop -p openceres-cli
+          name="OpenCeres-${{ steps.version.outputs.value }}-linux-x86_64"
+          mkdir -p "dist/$name"
+          cp target/release/openceres-desktop target/release/openceres "dist/$name/"
+          cp crates/desktop/assets/icon-1024.png README.md LICENSE-MIT LICENSE-APACHE "dist/$name/"
+          tar -C dist -czf "dist/$name.tar.gz" "$name"
+          rm -rf "dist/$name"
+
+      - name: Build Windows app
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          cargo build --release --locked -p openceres-desktop -p openceres-cli
+          $name = "OpenCeres-${{ steps.version.outputs.value }}-windows-x86_64"
+          New-Item -ItemType Directory -Force "dist/$name" | Out-Null
+          Copy-Item target/release/openceres-desktop.exe "dist/$name/OpenCeres.exe"
+          Copy-Item target/release/openceres.exe, README.md, LICENSE-MIT, LICENSE-APACHE "dist/$name/"
+          Compress-Archive -Path "dist/$name/*" -DestinationPath "dist/$name.zip"
+          Remove-Item -Recurse "dist/$name"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: OpenCeres-${{ matrix.name }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    name: Publish release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ github.ref_name }}" dist/* \
+            --repo "${{ github.repository }}" \
+            --title "OpenCeres ${{ github.ref_name }}" \
+            --generate-notes

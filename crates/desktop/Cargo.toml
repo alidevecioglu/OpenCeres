@@ -1,0 +1,26 @@
+[package]
+name = "openceres-desktop"
+description = "OpenCeres desktop app (native, egui)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+# egui 0.36 needs a newer compiler than the core crates.
+rust-version = "1.95"
+publish = false
+
+[[bin]]
+name = "openceres-desktop"
+path = "src/main.rs"
+
+[dependencies]
+openceres-core = { path = "../core" }
+# Window, input and immediate-mode UI. Only the OpenGL (glow) renderer, the
+# built-in font and the Linux window systems: no wgpu, persistence, accesskit
+# or link opening, which together would several-fold the binary.
+eframe = { version = "=0.36.2", default-features = false, features = ["glow", "default_fonts", "x11", "wayland"] }
+# Native "open files" dialog (NSOpenPanel / Windows / XDG portal); the portal
+# backend avoids linking GTK on Linux.
+rfd = { version = "=0.17.2", default-features = false, features = ["xdg-portal"] }
+# Deflate decoder for zipped image sets; small, pure Rust, no unsafe.
+miniz_oxide = "=0.9.1"

@@ -1,0 +1,101 @@
+#!/bin/sh
+# Build and run the macOS app on this Mac (Docker can't build macOS apps).
+#
+# Rust lives only in .cache/macos-toolchain (git-ignored); delete that folder to
+# remove it. Needs Apple's command-line tools (xcode-select --install).
+#
+#   ./mac setup        install Rust 1.98.1 into .cache/macos-toolchain
+#   ./mac build        build target/macos/release/OpenCeres.app (native egui app)
+#   ./mac run          build, then open the app
+#   ./mac dmg          build, then make target/macos/release/OpenCeres-<version>.dmg
+#
+# OPENCERES_UNIVERSAL=1 builds one binary for both Apple Silicon and Intel Macs.
+#   ./mac <cmd...>     run any command with the toolchain on PATH
+set -e
+cd "$(dirname "$0")"
+ROOT="$PWD"
+
+export RUSTUP_HOME="$ROOT/.cache/macos-toolchain/rustup"
+export CARGO_HOME="$ROOT/.cache/macos-toolchain/cargo"
+export CARGO_TARGET_DIR="$ROOT/target/macos"
+export PATH="$CARGO_HOME/bin:$PATH"
+APP="$CARGO_TARGET_DIR/release/OpenCeres.app"
+
+setup() {
+  [ -x "$CARGO_HOME/bin/cargo" ] && return
+  dl="$ROOT/.cache/macos-toolchain/download"
+  mkdir -p "$dl"
+  base=https://static.rust-lang.org/rustup/dist/aarch64-apple-darwin
+  curl -sSfL -o "$dl/rustup-init" "$base/rustup-init"
+  curl -sSfL -o "$dl/rustup-init.sha256" "$base/rustup-init.sha256"
+  [ "$(shasum -a 256 "$dl/rustup-init" | cut -d' ' -f1)" = "$(cut -d' ' -f1 "$dl/rustup-init.sha256")" ] \
+    || { echo "rustup-init checksum mismatch" >&2; exit 1; }
+  chmod +x "$dl/rustup-init"
+  "$dl/rustup-init" -y --no-modify-path --profile minimal --default-toolchain 1.98.1 \
+    --component clippy,rustfmt
+}
+
+version() { sed -n 's/^version = "\(.*\)"/\1/p' "$ROOT/Cargo.toml" | head -n 1; }
+
+# Assembles the .app by hand: it is just a folder with the binary, an
+# Info.plist and the icon, so no bundling tool is needed.
+build() {
+  setup
+  rm -rf "$APP"
+  mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+  if [ -n "$OPENCERES_UNIVERSAL" ]; then
+    rustup target add aarch64-apple-darwin x86_64-apple-darwin
+    for t in aarch64-apple-darwin x86_64-apple-darwin; do
+      cargo build --release -p openceres-desktop --target "$t"
+    done
+    lipo -create -output "$APP/Contents/MacOS/openceres-desktop" \
+      "$CARGO_TARGET_DIR/aarch64-apple-darwin/release/openceres-desktop" \
+      "$CARGO_TARGET_DIR/x86_64-apple-darwin/release/openceres-desktop"
+  else
+    cargo build --release -p openceres-desktop
+    cp "$CARGO_TARGET_DIR/release/openceres-desktop" "$APP/Contents/MacOS/"
+  fi
+  cp "$ROOT/crates/desktop/assets/icon.icns" "$APP/Contents/Resources/AppIcon.icns"
+  version=$(version)
+  cat > "$APP/Contents/Info.plist" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleDevelopmentRegion</key><string>en</string>
+  <key>CFBundleDisplayName</key><string>OpenCeres</string>
+  <key>CFBundleExecutable</key><string>openceres-desktop</string>
+  <key>CFBundleIconFile</key><string>AppIcon</string>
+  <key>CFBundleIdentifier</key><string>org.openceres.desktop</string>
+  <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
+  <key>CFBundleName</key><string>OpenCeres</string>
+  <key>CFBundlePackageType</key><string>APPL</string>
+  <key>CFBundleShortVersionString</key><string>$version</string>
+  <key>CFBundleVersion</key><string>$version</string>
+  <key>LSApplicationCategoryType</key><string>public.app-category.education</string>
+  <key>LSMinimumSystemVersion</key><string>11.0</string>
+  <key>NSHighResolutionCapable</key><true/>
+  <key>NSSupportsAutomaticGraphicsSwitching</key><true/>
+</dict>
+</plist>
+EOF
+  codesign --force -s - "$APP"
+}
+
+case "${1:-run}" in
+  setup) setup ;;
+  build) build; echo "Built $APP" ;;
+  dmg)
+    build
+    dmg="$CARGO_TARGET_DIR/release/OpenCeres-$(version).dmg"
+    stage="$CARGO_TARGET_DIR/release/dmg-stage"
+    rm -rf "$stage" "$dmg"
+    mkdir -p "$stage"
+    cp -R "$APP" "$stage/"
+    ln -s /Applications "$stage/Applications"
+    hdiutil create -volname OpenCeres -srcfolder "$stage" -format UDZO -ov "$dmg" >/dev/null
+    rm -rf "$stage"
+    echo "Built $dmg" ;;
+  run) build; open "$APP" ;;
+  *) setup; exec "$@" ;;
+esac

@@ -1,0 +1,14 @@
+services:
+  dev:
+    build: .
+    image: openceres-dev:latest
+    working_dir: /work
+    volumes:
+      - .:/work
+      # Keep downloaded crates and build output between runs, inside the repo
+      # (.cache/ and target/ are git-ignored).
+      - ./.cache/cargo-registry:/usr/local/cargo/registry
+      - ./.cache/cargo-git:/usr/local/cargo/git
+    environment:
+      CARGO_TARGET_DIR: /work/target/linux
+

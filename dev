@@ -1,0 +1,16 @@
+#!/bin/sh
+# Run a command inside the OpenCeres dev container.
+#
+#   ./dev cargo test
+#   ./dev cargo run -p openceres-cli -- stars image.fits
+#   ./dev check        fmt + clippy + tests (all crates)
+#   ./dev shell        interactive shell
+set -e
+cd "$(dirname "$0")"
+
+case "${1:-shell}" in
+  shell) set -- bash ;;
+  check) set -- sh -c 'cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace' ;;
+esac
+
+exec docker compose run --rm dev "$@"

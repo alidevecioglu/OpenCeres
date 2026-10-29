@@ -1,0 +1,17 @@
+# Local notes for humans and AI assistants; never committed.
+MEMORY.md
+
+# Rust
+/target/
+
+# Docker build caches (see compose.yaml)
+/.cache/
+
+# Real survey images and reports stay local (data-use rules, observer details).
+/data/
+
+# Editors / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp

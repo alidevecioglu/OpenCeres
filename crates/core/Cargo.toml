@@ -1,0 +1,11 @@
+[package]
+name = "openceres-core"
+description = "Image reduction and astrometry core for OpenCeres"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+# Deliberately dependency-free; see CLAUDE.md before adding one.
+[dependencies]
