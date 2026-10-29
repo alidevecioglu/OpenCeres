@@ -112,8 +112,13 @@ jobs:
           cargo build --release --locked -p openceres-desktop -p openceres-cli
           $name = "OpenCeres-${{ steps.version.outputs.value }}-windows-x86_64"
           New-Item -ItemType Directory -Force "dist/$name" | Out-Null
+          # Windows names are case-insensitive: the CLI's openceres.exe would
+          # overwrite OpenCeres.exe, so it ships as openceres-cli.exe.
           Copy-Item target/release/openceres-desktop.exe "dist/$name/OpenCeres.exe"
-          Copy-Item target/release/openceres.exe, README.md, LICENSE-MIT, LICENSE-APACHE "dist/$name/"
+          Copy-Item target/release/openceres.exe "dist/$name/openceres-cli.exe"
+          Copy-Item README.md, LICENSE-MIT, LICENSE-APACHE "dist/$name/"
+          $app = Get-Item "dist/$name/OpenCeres.exe"
+          if ($app.Length -lt 1MB) { throw "OpenCeres.exe is only $($app.Length) bytes; expected the desktop app" }
           Compress-Archive -Path "dist/$name/*" -DestinationPath "dist/$name.zip"
           Remove-Item -Recurse "dist/$name"
 
