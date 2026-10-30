@@ -10,7 +10,7 @@
 
 use eframe::egui;
 
-use crate::app::{App, settings_ui};
+use crate::app::{App, history_ui, settings_ui};
 use crate::icons::Icon;
 use crate::prefs::{GRID_SIZES, KnownSource, Prefs, SPEEDS, ThemeChoice};
 
@@ -22,18 +22,20 @@ pub enum Category {
     Viewing,
     ReportGrid,
     Known,
+    History,
     Updates,
     Shortcuts,
     About,
 }
 
 impl Category {
-    pub const ALL: [Category; 8] = [
+    pub const ALL: [Category; 9] = [
         Category::General,
         Category::Appearance,
         Category::Viewing,
         Category::ReportGrid,
         Category::Known,
+        Category::History,
         Category::Updates,
         Category::Shortcuts,
         Category::About,
@@ -46,6 +48,7 @@ impl Category {
             Category::Viewing => "Viewing",
             Category::ReportGrid => "Report grid",
             Category::Known => "Known objects",
+            Category::History => "History",
             Category::Updates => "Updates",
             Category::Shortcuts => "Shortcuts",
             Category::About => "About",
@@ -59,6 +62,7 @@ impl Category {
             Category::Viewing => Icon::Eye,
             Category::ReportGrid => Icon::Grid,
             Category::Known => Icon::Known,
+            Category::History => Icon::History,
             Category::Updates => Icon::Update,
             Category::Shortcuts => Icon::Keyboard,
             Category::About => Icon::Info,
@@ -276,6 +280,35 @@ pub static ENTRIES: &[Entry] = &[
                       the server without downloading.",
         keywords: "download update catalogue catalog offline orbit database mpc check",
         kind: Kind::Custom(settings_ui::mpcorb),
+    },
+    // History
+    Entry {
+        id: "history_name",
+        category: Category::History,
+        label: "Your name",
+        description: "Filled in as “Searched by” on new searches. On a shared computer, \
+                      each student can type their own name in the side panel instead.",
+        keywords: "student name searched by observer person profile",
+        kind: Kind::Custom(history_ui::name_setting),
+    },
+    Entry {
+        id: "history_folder",
+        category: Category::History,
+        label: "History folder",
+        description: "Each search is saved here as a small file of its own. Choose a \
+                      shared folder (OneDrive, Google Drive or a network drive) to \
+                      collect a whole class's searches in one place.",
+        keywords: "folder location shared class teacher onedrive google drive network sync",
+        kind: Kind::Custom(history_ui::folder_setting),
+    },
+    Entry {
+        id: "history_window",
+        category: Category::History,
+        label: "Search history",
+        description: "Every search, its status and notes. Export it for a teacher or \
+                      import a class's searches. H opens it from the main window.",
+        keywords: "history searches export import csv json teacher finds reported",
+        kind: Kind::Custom(history_ui::open_history),
     },
     // Updates
     Entry {

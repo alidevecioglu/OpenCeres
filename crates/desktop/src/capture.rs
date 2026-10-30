@@ -13,11 +13,13 @@
 //! its own window and exits. `OPENCERES_SCREENSHOT_STATE` is a comma list of:
 //! `light`, `dark`, `stars`, `invert`, `grid`, `panel`, `settings` (or
 //! `settings=PAGE`, e.g. `settings=updates`), `search=TEXT` (in Settings),
-//! `update=VERSION` (pretend that version is available), `help`,
-//! `paused`, `frame=N` (1-based), `mark=RxC` (row × column, repeatable),
-//! `gridsize=N`, `known` (look up known objects and wait for the answer),
-//! `focus=LABEL` (centre and zoom on that known object) and `size=WxH`
-//! (window size in points).
+//! `update=VERSION` (pretend that version is available), `help`, `history`
+//! or `history=SET` (the history window, with SET's search opened;
+//! screenshots leave the history alone unless `OPENCERES_HISTORY_DIR` gives
+//! them a folder), `paused`, `frame=N`
+//! (1-based), `mark=RxC` (row × column, repeatable), `gridsize=N`, `known`
+//! (look up known objects and wait for the answer), `focus=LABEL` (centre
+//! and zoom on that known object) and `size=WxH` (window size in points).
 
 use eframe::egui;
 
@@ -33,6 +35,8 @@ pub struct State {
     pub search: Option<String>,
     pub update: Option<String>,
     pub help: bool,
+    /// The history window, with the first search of this set opened ("" = none).
+    pub history: Option<String>,
     pub paused: bool,
     pub known: bool,
     pub focus: Option<String>,
@@ -96,6 +100,7 @@ impl State {
                 "search" => s.search = Some(value.to_owned()),
                 "update" => s.update = Some(value.to_owned()).filter(|v| !v.is_empty()),
                 "help" => s.help = true,
+                "history" => s.history = Some(value.to_owned()),
                 "paused" => s.paused = true,
                 "known" => s.known = true,
                 "focus" => s.focus = Some(value.to_owned()).filter(|v| !v.is_empty()),

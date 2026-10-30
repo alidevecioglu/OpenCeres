@@ -22,6 +22,7 @@ pub enum Icon {
     Known,
     Sidebar,
     Gear,
+    History,
     Close,
     Check,
     // Settings categories and search.
@@ -213,6 +214,14 @@ pub fn paint(painter: &egui::Painter, rect: Rect, icon: Icon, color: Color32) {
         Icon::Search => {
             painter.circle_stroke(at(-1.25, -1.25), 4.25 * s, stroke);
             painter.line_segment([at(1.9, 1.9), at(5.5, 5.5)], Stroke::new(1.75, color));
+        }
+        Icon::History => {
+            // A clock face.
+            painter.circle_stroke(c, 6.5 * s, stroke);
+            painter.line(
+                vec![at(0.0, -3.75), at(0.0, 0.0), at(2.75, 1.75)],
+                Stroke::new(1.5, color),
+            );
         }
         Icon::Check => {
             painter.line(

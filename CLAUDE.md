@@ -56,6 +56,11 @@ objects, measure positions, write MPC reports. Product priorities, in order:
   windowed centroids), `wcs` (TAN projection), `time` (JD ↔ calendar),
   `mpc` (80-column format), `render` (display stretch).
 - `crates/cli/` — `openceres info|stars` for checking the core on real files.
+- `crates/desktop/src/history.rs` — search history: one JSON file per search
+  (id = file name, so imported ids are validated), merge-by-id import,
+  CSV/JSON export. UI in `app/history_ui.rs`; `json.rs` is the shared
+  hand-written parser/writer. Screenshots only touch the history when
+  `OPENCERES_HISTORY_DIR` is set.
 - `crates/desktop/` — the desktop app: egui/eframe with the glow (OpenGL)
   backend, no web technology (user requirement: minimum resource use).
   Frames are R8 textures drawn by a small shader (invert is a uniform);

@@ -45,6 +45,12 @@ It is named after Ceres, the first asteroid ever found (Piazzi, 1801).
 - **Easy report** — turn on the grid (3×3 to 8×8), click every box where
   something moves and copy a ready-to-send report such as `XY57_p01: 2x3`.
   Boxes are named row × column from the top-left, like the team charts.
+- **Search history** — every search is saved as you work: who searched,
+  the marked boxes, notes and its status as it moves through IASC's steps
+  (reported → preliminary detection → provisional designation → numbered).
+  Reopen a set to continue where you left off. Point the history at a
+  shared folder (OneDrive, Google Drive, a network drive) to collect a whole
+  class's searches, or export them for a teacher as JSON or a spreadsheet.
 - **Tiny and fast** — native Rust with no web engine: about 5 MB, starts
   instantly and uses ~0 % CPU when idle. The core library has no third-party
   dependencies.

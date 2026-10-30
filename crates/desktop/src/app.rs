@@ -1,6 +1,7 @@
 //! The OpenCeres window: a slim toolbar, the image stage (almost all of the
 //! window), an optional report side panel and a slim status bar.
 
+pub(crate) mod history_ui;
 pub(crate) mod settings_ui;
 
 use std::path::PathBuf;
@@ -16,6 +17,7 @@ use eframe::egui::{
 use crate::capture::{self, Capture};
 use crate::format;
 use crate::gpu::{Draw, Gpu};
+use crate::history::{self, Record, box_label, report_line};
 use crate::icons::{self, Icon};
 use crate::known::{self, Catalogue, Download, Fetched, Freshness, Lookup, LookupError};
 use crate::load::{self, Frame as ImageFrame, ImageSet};
@@ -43,11 +45,14 @@ struct Set {
     /// Frames in time order, without their pixels (those live on the GPU).
     frames: Vec<ImageFrame>,
     summary: String,
+    /// The files that were opened, for the search history.
+    paths: Vec<String>,
 }
 
 struct Loading {
     message: String,
     rx: Receiver<Result<ImageSet, String>>,
+    paths: Vec<String>,
 }
 
 /// Known objects for the open set: being looked up, found, or why not.
@@ -104,6 +109,35 @@ struct Updates {
     download_error: Option<String>,
 }
 
+/// The search history (see [`crate::history`]).
+#[derive(Default)]
+struct Searches {
+    config: history::Config,
+    /// Screenshots leave the history alone unless `OPENCERES_HISTORY_DIR`
+    /// points them at a folder of their own.
+    enabled: bool,
+    /// The open set's search, and the copy last written to disk.
+    record: Option<Record>,
+    saved: Option<Record>,
+    /// When the open set's search continues an earlier one: its last change.
+    resumed: Option<u64>,
+    /// Others who searched the open set (from a shared folder or imports).
+    others: Vec<String>,
+    /// Search to continue when the set being loaded opens (History → Open).
+    resume_id: Option<String>,
+    window_open: bool,
+    /// The whole folder, read when the window opens; `None` = read again.
+    list: Option<Vec<Record>>,
+    unreadable: usize,
+    filter: history_ui::Filter,
+    search: String,
+    expanded: Option<String>,
+    confirm_delete: Option<String>,
+    error: Option<String>,
+    /// e.g. "Imported 3 new searches".
+    note: Option<String>,
+}
+
 struct Drag {
     start: Pos2,
     offset: Vec2,
@@ -147,6 +181,7 @@ pub struct App {
     mpcorb_newer: bool,
     mpcorb_auto_done: bool,
     updates: Updates,
+    searches: Searches,
     /// What Settings shows about the offline catalogue; `None` = read again.
     catalogue: Option<Catalogue>,
     loading: Option<Loading>,
@@ -182,6 +217,7 @@ fn shortcuts() -> Vec<(Vec<String>, &'static str)> {
         (keys(&["I"]), "Invert"),
         (keys(&["G"]), "Report grid (click a box to mark it)"),
         (keys(&["K"]), "Known objects in the field"),
+        (keys(&["H"]), "Search history"),
         (keys(&["Tab"]), "Side panel (or \\)"),
         (vec!["O".into(), format!("{cmd}O")], "Open an image set"),
         (vec![format!("{cmd},")], "Settings"),
@@ -210,6 +246,11 @@ impl App {
             }
             prefs.panel_open |= c.state.panel;
         }
+        let searches = Searches {
+            config: history::Config::load(),
+            enabled: capture.is_none() || std::env::var_os("OPENCERES_HISTORY_DIR").is_some(),
+            ..Searches::default()
+        };
         let mut app = App {
             prefs,
             saved: prefs,
@@ -237,6 +278,7 @@ impl App {
             mpcorb_newer: false,
             mpcorb_auto_done: false,
             updates: Updates::default(),
+            searches,
             catalogue: None,
             loading: None,
             error: None,
@@ -291,11 +333,19 @@ impl App {
         self.error = None;
         let (tx, rx) = std::sync::mpsc::channel();
         let ctx = ctx.clone();
+        // Absolute, so the search history can open them again from anywhere.
+        let paths = files
+            .iter()
+            .map(|f| {
+                std::path::absolute(f)
+                    .map_or_else(|_| f.clone(), |p| p.to_string_lossy().into_owned())
+            })
+            .collect();
         std::thread::spawn(move || {
             let _ = tx.send(load::open(&files));
             ctx.request_repaint();
         });
-        self.loading = Some(Loading { message, rx });
+        self.loading = Some(Loading { message, rx, paths });
     }
 
     fn choose(&mut self, ctx: &egui::Context, frame: &eframe::Frame) {
@@ -323,7 +373,7 @@ impl App {
             Err(TryRecvError::Empty) => return,
             Err(TryRecvError::Disconnected) => Err("image loader crashed".into()),
         };
-        self.loading = None;
+        let paths = self.loading.take().map(|l| l.paths).unwrap_or_default();
         match result {
             Ok(ImageSet { name, mut frames }) => {
                 let pixels = frames
@@ -336,6 +386,7 @@ impl App {
                     name,
                     frames,
                     summary,
+                    paths,
                 });
                 self.marks.clear();
                 self.copied = false;
@@ -346,8 +397,12 @@ impl App {
                 self.next_switch = now + self.period();
                 self.view = View::default();
                 self.hover = None;
+                self.start_search();
             }
-            Err(e) => self.error = Some(e),
+            Err(e) => {
+                self.searches.resume_id = None;
+                self.error = Some(e);
+            }
         }
     }
 
@@ -626,6 +681,7 @@ impl App {
 
     fn open_settings(&mut self, page: Category) {
         self.settings_open = true;
+        self.searches.window_open = false;
         self.settings_page = page;
         self.settings_search.clear();
         self.help_open = false;
@@ -749,9 +805,10 @@ impl App {
                     let command = modifiers.command || modifiers.ctrl || modifiers.mac_cmd;
                     if command && !modifiers.alt {
                         match key {
-                            Key::O if !self.settings_open => self.choose(ctx, frame),
+                            Key::O if !self.modal_open() => self.choose(ctx, frame),
                             Key::Comma => {
                                 self.settings_open = !self.settings_open;
+                                self.searches.window_open = false;
                                 self.help_open = false;
                             }
                             _ => continue,
@@ -759,12 +816,13 @@ impl App {
                         handled = true;
                         continue;
                     }
-                    if key == Key::Escape && (self.help_open || self.settings_open) {
+                    if key == Key::Escape && (self.help_open || self.modal_open()) {
                         self.help_open = false;
                         self.settings_open = false;
+                        self.searches.window_open = false;
                         handled = true;
                     }
-                    if self.settings_open || modifiers.alt || command {
+                    if self.modal_open() || modifiers.alt || command {
                         continue;
                     }
                     handled |= match key {
@@ -788,7 +846,7 @@ impl App {
                     };
                 }
                 // Characters, not keys, so `,` `.` `+` `?` work on any layout.
-                Event::Text(text) if !self.settings_open && !command_held => {
+                Event::Text(text) if !self.modal_open() && !command_held => {
                     handled = true;
                     match text.as_str() {
                         "+" | "=" => self.zoom_by(1.25, None),
@@ -798,6 +856,7 @@ impl App {
                         "i" | "I" => self.invert = !self.invert,
                         "g" | "G" => self.set_grid(!self.grid_on),
                         "k" | "K" => self.set_known(!self.known_on),
+                        "h" | "H" => self.toggle_history(),
                         "," | "[" => self.change_speed(1, now),
                         "." | "]" => self.change_speed(-1, now),
                         "o" | "O" => self.choose(ctx, frame),
@@ -902,7 +961,9 @@ impl App {
             self.set_grid(true);
         }
         self.prefs.panel_open |= s.panel;
-        self.marks = s.marks;
+        if !s.marks.is_empty() {
+            self.marks = s.marks;
+        }
         if s.paused || s.frame.is_some() {
             self.playing = false;
         }
@@ -910,6 +971,15 @@ impl App {
             self.index = n - 1;
         }
         self.settings_open = s.settings;
+        if let Some(set) = s.history {
+            self.searches.window_open = true;
+            self.reload_history();
+            self.searches.expanded = self.searches.list.as_ref().and_then(|l| {
+                l.iter()
+                    .find(|r| !set.is_empty() && r.set == set)
+                    .map(|r| r.id.clone())
+            });
+        }
         if let Some(page) = s.settings_page.as_deref().and_then(Category::from_key) {
             self.settings_page = page;
         }
@@ -964,6 +1034,12 @@ impl App {
                             .on_hover_text("Report panel (Tab)");
                         if panel.clicked() {
                             self.prefs.panel_open = !self.prefs.panel_open;
+                        }
+                        let history =
+                            icons::button(ui, Icon::History, self.searches.window_open, true)
+                                .on_hover_text("Search history (H)");
+                        if history.clicked() {
+                            self.toggle_history();
                         }
                         if let Some(r) = &self.updates.found {
                             ui.add_space(S1);
@@ -1199,6 +1275,12 @@ impl App {
                 let count = (!self.marks.is_empty()).then_some(self.marks.len());
                 section_heading(ui, "Easy report", count);
                 self.report_section(ui);
+                if self.set.is_some() && self.searches.record.is_some() {
+                    ui.add_space(S3);
+                    hline(ui, p.border);
+                    ui.add_space(S2);
+                    self.search_section(ui);
+                }
                 if self.known_on {
                     ui.add_space(S3);
                     hline(ui, p.border);
@@ -1293,6 +1375,7 @@ impl App {
             if copy.clicked() {
                 ui.ctx().copy_text(self.report());
                 self.copied = true;
+                self.mark_reported();
             }
             let clear = ui.add_enabled(
                 has_marks,
@@ -1921,6 +2004,8 @@ impl eframe::App for App {
         self.side_panel(ui);
         egui::CentralPanel::no_frame().show(ui, |ui| self.stage(ui, frame));
         self.settings_window(&ctx, now);
+        self.history_window(&ctx, frame);
+        self.autosave();
 
         if self.prefs != self.saved {
             if self.capture.is_none() {
@@ -2065,19 +2150,6 @@ fn known_row(ui: &mut egui::Ui, o: &KnownObject, detail: &str, selected: bool) -
 fn grid_box(u: f32, v: f32, n: usize) -> (usize, usize) {
     let cell = |t: f32| ((t.max(0.0) * n as f32).floor() as usize + 1).min(n);
     (cell(v), cell(u))
-}
-
-/// The team's box name: row × column, e.g. `1x2` = top row, second column.
-fn box_label((row, col): (usize, usize)) -> String {
-    format!("{row}x{col}")
-}
-
-/// e.g. `XY57_p01: 1x2 2x1`, boxes in reading order (by row, then column).
-fn report_line(name: &str, marks: &[(usize, usize)]) -> String {
-    let mut boxes = marks.to_vec();
-    boxes.sort_unstable();
-    let boxes: Vec<String> = boxes.into_iter().map(box_label).collect();
-    format!("{name}: {}", boxes.join(" "))
 }
 
 fn command_key(key: &str) -> String {

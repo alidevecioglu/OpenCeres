@@ -147,43 +147,17 @@ impl App {
             ui.allocate_ui_with_layout(
                 vec2(w, theme::TOOL + 2.0),
                 Layout::left_to_right(Align::Center),
-                |ui| self.search_field(ui, w),
+                |ui| {
+                    search_box(
+                        ui,
+                        &mut self.settings_search,
+                        "Search settings",
+                        "settings_search",
+                        w,
+                    );
+                },
             );
         });
-    }
-
-    fn search_field(&mut self, ui: &mut egui::Ui, w: f32) {
-        let p = palette(ui);
-        Frame::new()
-            .fill(p.inset)
-            .stroke(Stroke::new(1.0, p.border))
-            .corner_radius(theme::RADIUS)
-            .inner_margin(Margin::symmetric(S2 as i8, 3))
-            .show(ui, |ui| {
-                ui.set_width(w - 2.0 * S2);
-                ui.horizontal(|ui| {
-                    ui.spacing_mut().item_spacing.x = S1;
-                    let (r, _) = ui.allocate_exact_size(vec2(14.0, 20.0), Sense::hover());
-                    icons::paint(ui.painter(), r, Icon::Search, p.muted);
-                    let clear = !self.settings_search.is_empty();
-                    let edit_w = ui.available_width() - if clear { 24.0 } else { 0.0 };
-                    ui.add(
-                        TextEdit::singleline(&mut self.settings_search)
-                            .id(Id::new("settings_search"))
-                            .hint_text("Search settings")
-                            .frame(Frame::NONE)
-                            .margin(Margin::ZERO)
-                            .desired_width(edit_w),
-                    );
-                    if clear
-                        && icons::small_button(ui, Icon::Close, p.muted)
-                            .on_hover_text("Clear search")
-                            .clicked()
-                    {
-                        self.settings_search.clear();
-                    }
-                });
-            });
     }
 
     fn settings_page_content(&mut self, ui: &mut egui::Ui) {
@@ -345,6 +319,41 @@ impl App {
             Kind::Custom(_) => {}
         }
     }
+}
+
+/// A search field with a magnifier and a clear button, `w` points wide.
+pub(super) fn search_box(ui: &mut egui::Ui, text: &mut String, hint: &str, id: &str, w: f32) {
+    let p = palette(ui);
+    Frame::new()
+        .fill(p.inset)
+        .stroke(Stroke::new(1.0, p.border))
+        .corner_radius(theme::RADIUS)
+        .inner_margin(Margin::symmetric(S2 as i8, 3))
+        .show(ui, |ui| {
+            ui.set_width(w - 2.0 * S2);
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = S1;
+                let (r, _) = ui.allocate_exact_size(vec2(14.0, 20.0), Sense::hover());
+                icons::paint(ui.painter(), r, Icon::Search, p.muted);
+                let clear = !text.is_empty();
+                let edit_w = ui.available_width() - if clear { 24.0 } else { 0.0 };
+                ui.add(
+                    TextEdit::singleline(text)
+                        .id(Id::new(id))
+                        .hint_text(hint)
+                        .frame(Frame::NONE)
+                        .margin(Margin::ZERO)
+                        .desired_width(edit_w),
+                );
+                if clear
+                    && icons::small_button(ui, Icon::Close, p.muted)
+                        .on_hover_text("Clear search")
+                        .clicked()
+                {
+                    text.clear();
+                }
+            });
+        });
 }
 
 /// A sidebar row: icon and label (icon only when narrow).
