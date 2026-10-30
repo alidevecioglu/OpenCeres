@@ -74,7 +74,7 @@
   h2 { font-size: 28px; letter-spacing: -0.01em; margin: 0 0 8px; }
   .sub { color: var(--muted); margin: 0 0 28px; }
 
-  .grid { display: grid; gap: 16px; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); }
+  .grid { display: grid; gap: 16px; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); }
   .card { background: var(--card); border: 1px solid var(--line); border-radius: 14px; padding: 20px; }
   .card h3 { margin: 0 0 6px; font-size: 17px; }
   .card p { margin: 0; color: var(--muted); font-size: 15px; }
@@ -93,11 +93,12 @@
   .platform a.dl.primary { background: var(--accent); color: var(--accent-ink); border-color: transparent; }
   .platform .alt { font-size: 14px; color: var(--muted); }
   .platform .note { font-size: 13px; color: var(--muted); margin: 0; }
-  code { font: 13px/1.4 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; background: rgba(255,255,255,0.08); padding: 2px 6px; border-radius: 6px; word-break: break-all; }
+  code { font: 13px/1.4 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; background: rgba(255,255,255,0.08); padding: 2px 6px; border-radius: 6px; white-space: nowrap; }
 
-  .two { display: grid; gap: 24px; grid-template-columns: 1fr 1fr; align-items: center; }
-  .two img { width: 100%; border-radius: 12px; border: 1px solid var(--line); }
-  @media (max-width: 760px) { .two { grid-template-columns: 1fr; } nav .links a.hide-sm { display: none; } }
+  .two { display: grid; gap: 32px; }
+  .two > div { max-width: 760px; }
+  .two img { width: 100%; height: auto; border-radius: 12px; border: 1px solid var(--line); box-shadow: 0 30px 80px rgba(0, 0, 0, 0.5); }
+  @media (max-width: 760px) { nav .links a.hide-sm { display: none; } }
 
   .status { border-left: 3px solid var(--accent); background: rgba(245, 179, 53, 0.07); padding: 14px 18px; border-radius: 0 10px 10px 0; color: var(--text); }
 
