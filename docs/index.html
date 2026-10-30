@@ -1,0 +1,253 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>OpenCeres — open-source asteroid search</title>
+<meta name="description" content="A small, fast, open-source app for asteroid searching: blink survey images, spot moving objects, check known asteroids and write reports. For macOS, Windows and Linux.">
+<meta property="og:title" content="OpenCeres">
+<meta property="og:description" content="Small, fast, open-source asteroid search for macOS, Windows and Linux.">
+<meta property="og:image" content="https://alidevecioglu.github.io/OpenCeres/assets/icon-512.png">
+<link rel="icon" type="image/png" href="assets/favicon.png">
+<link rel="apple-touch-icon" href="assets/icon-256.png">
+<style>
+  :root {
+    --bg: #070b1f;
+    --bg-2: #0d1636;
+    --card: rgba(255, 255, 255, 0.04);
+    --line: rgba(255, 255, 255, 0.10);
+    --text: #e8ecf7;
+    --muted: #9aa5c4;
+    --accent: #f5b335;
+    --accent-ink: #1b1200;
+    --link: #9cc0ff;
+    color-scheme: dark;
+  }
+  * { box-sizing: border-box; }
+  html { -webkit-text-size-adjust: 100%; }
+  body {
+    margin: 0;
+    font: 16px/1.6 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+    color: var(--text);
+    background:
+      radial-gradient(1200px 600px at 20% -10%, #1a2b6b 0%, transparent 60%),
+      radial-gradient(900px 500px at 110% 10%, #2a1a4f 0%, transparent 55%),
+      var(--bg);
+    background-attachment: fixed;
+  }
+  a { color: var(--link); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  .wrap { max-width: 1080px; margin: 0 auto; padding: 0 16px; }
+
+  nav { display: flex; align-items: center; justify-content: space-between; padding: 20px 0; }
+  nav .brand { display: flex; align-items: center; gap: 10px; font-weight: 650; color: var(--text); }
+  nav .brand img { width: 32px; height: 32px; }
+  nav .links { display: flex; gap: 20px; font-size: 15px; }
+  nav .links a { color: var(--muted); }
+  nav .links a:hover { color: var(--text); text-decoration: none; }
+
+  header.hero { text-align: center; padding: 48px 0 32px; }
+  .hero .icon { width: 148px; height: 148px; filter: drop-shadow(0 20px 40px rgba(20, 40, 140, 0.55)); }
+  .hero h1 { font-size: clamp(40px, 7vw, 64px); line-height: 1.05; margin: 20px 0 12px; letter-spacing: -0.02em; }
+  .hero p.lead { font-size: clamp(17px, 2.4vw, 21px); color: var(--muted); max-width: 640px; margin: 0 auto; }
+
+  .download { margin: 32px auto 0; display: flex; flex-direction: column; align-items: center; gap: 12px; }
+  .btn {
+    display: inline-flex; align-items: center; gap: 10px;
+    padding: 14px 26px; border-radius: 12px; font-weight: 650; font-size: 17px;
+    background: var(--accent); color: var(--accent-ink);
+    box-shadow: 0 10px 30px rgba(245, 179, 53, 0.25);
+    transition: transform .12s ease, box-shadow .12s ease;
+  }
+  .btn:hover { text-decoration: none; transform: translateY(-1px); box-shadow: 0 14px 36px rgba(245, 179, 53, 0.35); }
+  .btn svg { width: 20px; height: 20px; }
+  .meta { color: var(--muted); font-size: 14px; }
+  .meta a { color: var(--muted); text-decoration: underline; text-underline-offset: 2px; }
+
+  .shot { margin: 48px auto 0; max-width: 1000px; }
+  .shot img {
+    width: 100%; height: auto; display: block; border-radius: 12px;
+    border: 1px solid var(--line); box-shadow: 0 30px 80px rgba(0, 0, 0, 0.6);
+  }
+
+  section { padding: 72px 0 0; }
+  h2 { font-size: 28px; letter-spacing: -0.01em; margin: 0 0 8px; }
+  .sub { color: var(--muted); margin: 0 0 28px; }
+
+  .grid { display: grid; gap: 16px; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 14px; padding: 20px; }
+  .card h3 { margin: 0 0 6px; font-size: 17px; }
+  .card p { margin: 0; color: var(--muted); font-size: 15px; }
+  .card .k { color: var(--accent); font-weight: 700; font-size: 13px; letter-spacing: .06em; text-transform: uppercase; }
+
+  .platforms { display: grid; gap: 16px; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); }
+  .platform { display: flex; flex-direction: column; gap: 10px; }
+  .platform .row { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; }
+  .platform h3 { margin: 0; }
+  .platform .size { color: var(--muted); font-size: 13px; white-space: nowrap; }
+  .platform a.dl {
+    display: block; text-align: center; padding: 10px 14px; border-radius: 10px;
+    border: 1px solid var(--line); background: rgba(255,255,255,0.05); color: var(--text); font-weight: 600;
+  }
+  .platform a.dl:hover { background: rgba(255,255,255,0.10); text-decoration: none; }
+  .platform a.dl.primary { background: var(--accent); color: var(--accent-ink); border-color: transparent; }
+  .platform .alt { font-size: 14px; color: var(--muted); }
+  .platform .note { font-size: 13px; color: var(--muted); margin: 0; }
+  code { font: 13px/1.4 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; background: rgba(255,255,255,0.08); padding: 2px 6px; border-radius: 6px; word-break: break-all; }
+
+  .two { display: grid; gap: 24px; grid-template-columns: 1fr 1fr; align-items: center; }
+  .two img { width: 100%; border-radius: 12px; border: 1px solid var(--line); }
+  @media (max-width: 760px) { .two { grid-template-columns: 1fr; } nav .links a.hide-sm { display: none; } }
+
+  .status { border-left: 3px solid var(--accent); background: rgba(245, 179, 53, 0.07); padding: 14px 18px; border-radius: 0 10px 10px 0; color: var(--text); }
+
+  footer { margin-top: 88px; padding: 28px 0 40px; border-top: 1px solid var(--line); color: var(--muted); font-size: 14px; }
+  footer .wrap { display: flex; flex-wrap: wrap; gap: 12px 24px; justify-content: space-between; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <nav>
+    <a class="brand" href="./"><img src="assets/favicon.png" alt="">OpenCeres</a>
+    <div class="links">
+      <a href="#download">Download</a>
+      <a class="hide-sm" href="#features">Features</a>
+      <a href="https://github.com/alidevecioglu/OpenCeres">GitHub</a>
+    </div>
+  </nav>
+
+  <header class="hero">
+    <img class="icon" src="assets/icon-512.png" alt="OpenCeres icon: an asteroid streaking across a starry sky">
+    <h1>OpenCeres</h1>
+    <p class="lead">A small, fast, open-source app for asteroid searching. Blink your survey images, spot what moves, check known asteroids and send the report.</p>
+    <div class="download">
+      <a class="btn" id="main-download" href="https://github.com/alidevecioglu/OpenCeres/releases/latest">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3v12m0 0-5-5m5 5 5-5M4 19h16"/></svg>
+        <span id="main-label">Download OpenCeres</span>
+      </a>
+      <div class="meta" id="main-meta">Free for macOS, Windows and Linux · <a href="#download">All downloads</a></div>
+    </div>
+  </header>
+
+  <div class="shot">
+    <img src="assets/screenshot-known.jpg" width="1600" height="1000" alt="OpenCeres showing a Pan-STARRS image with two known asteroids circled and listed in the side panel">
+  </div>
+
+  <section id="features">
+    <h2>Made for search teams</h2>
+    <p class="sub">Built for students and amateur astronomers in campaigns such as IASC's, where teams blink Pan-STARRS images to discover new asteroids.</p>
+    <div class="grid">
+      <div class="card"><div class="k">Blink</div><h3>Open a set, press play</h3><p>Drop in a folder or the .zip you were sent. Frames load in parallel and blink at the speed you choose.</p></div>
+      <div class="card"><div class="k">Known objects</div><h3>See what's already found</h3><p>Known asteroids in the field are circled with name, brightness and motion, online via SkyBoT or offline from MPCORB.</p></div>
+      <div class="card"><div class="k">Easy report</div><h3>Click the boxes, copy, send</h3><p>Turn on the grid and click each box where something moves. The row × column report is ready to paste for your teacher.</p></div>
+      <div class="card"><div class="k">Tiny</div><h3>A few megabytes</h3><p>Native code with no web engine inside. Starts instantly and uses almost no CPU while idle.</p></div>
+      <div class="card"><div class="k">Everywhere</div><h3>Mac, Windows, Linux</h3><p>Runs natively on Apple Silicon and Intel Macs, Windows and Linux. No emulators or Wine needed.</p></div>
+      <div class="card"><div class="k">Open</div><h3>Free and open source</h3><p>MIT or Apache-2.0. Read the code, check the maths and help improve it.</p></div>
+    </div>
+  </section>
+
+  <section>
+    <div class="two">
+      <div>
+        <h2>From blink to report in a minute</h2>
+        <p class="sub">Pick a grid size, click the boxes where you saw movement, and copy a report like <code>XY57_p01: 2x3</code>. Boxes are counted from the top-left, the same way your team's charts are.</p>
+        <div class="status"><strong>Early development.</strong> Viewing, blinking, known objects and box reports work today. Automatic moving-object detection, plate solving against Gaia and MPC reports are on the way. Keep using your current software for official campaign measurements for now.</div>
+      </div>
+      <img src="assets/screenshot-report.jpg" width="1600" height="1000" loading="lazy" alt="OpenCeres with the 4×4 report grid on and box 2x3 selected">
+    </div>
+  </section>
+
+  <section id="download">
+    <h2>Download</h2>
+    <p class="sub" id="release-line">The latest release, built automatically from the source on GitHub.</p>
+    <div class="platforms">
+      <div class="card platform" data-os="mac">
+        <div class="row"><h3>macOS</h3><span class="size" data-size="dmg"></span></div>
+        <a class="dl" data-asset="-macos.dmg" href="https://github.com/alidevecioglu/OpenCeres/releases/latest">Download .dmg</a>
+        <div class="alt">or <a data-asset="-macos.zip" href="https://github.com/alidevecioglu/OpenCeres/releases/latest">.zip</a> · Apple Silicon and Intel</div>
+        <p class="note">First launch: right-click OpenCeres.app and choose <em>Open</em>, because the app is not yet notarised by Apple.</p>
+      </div>
+      <div class="card platform" data-os="windows">
+        <div class="row"><h3>Windows</h3><span class="size" data-size="win"></span></div>
+        <a class="dl" data-asset="-windows-x86_64.zip" href="https://github.com/alidevecioglu/OpenCeres/releases/latest">Download .zip</a>
+        <div class="alt">Windows 10 and 11, 64-bit</div>
+        <p class="note">Unzip and run <code>OpenCeres.exe</code>. If SmartScreen warns you, choose <em>More info → Run anyway</em>.</p>
+      </div>
+      <div class="card platform" data-os="linux">
+        <div class="row"><h3>Linux</h3><span class="size" data-size="linux"></span></div>
+        <a class="dl" data-asset="-linux-x86_64.tar.gz" href="https://github.com/alidevecioglu/OpenCeres/releases/latest">Download .tar.gz</a>
+        <div class="alt">x86_64, needs OpenGL</div>
+        <p class="note">Extract and run <code>./openceres-desktop</code>.</p>
+      </div>
+    </div>
+    <p class="meta" style="margin-top:18px">Older versions and release notes are on the <a href="https://github.com/alidevecioglu/OpenCeres/releases">releases page</a>.</p>
+  </section>
+</div>
+
+<footer>
+  <div class="wrap">
+    <span>OpenCeres is an independent project, not affiliated with IASC or any other software vendor.</span>
+    <span><a href="https://github.com/alidevecioglu/OpenCeres">Source</a> · <a href="https://github.com/alidevecioglu/OpenCeres/issues">Report a problem</a> · MIT / Apache-2.0</span>
+  </div>
+</footer>
+
+<script>
+(function () {
+  var repo = "alidevecioglu/OpenCeres";
+  var names = { mac: "macOS", windows: "Windows", linux: "Linux" };
+  var main = { mac: "-macos.dmg", windows: "-windows-x86_64.zip", linux: "-linux-x86_64.tar.gz" };
+  var sizeKey = { "-macos.dmg": "dmg", "-windows-x86_64.zip": "win", "-linux-x86_64.tar.gz": "linux" };
+
+  function detectOS() {
+    var p = ((navigator.userAgentData && navigator.userAgentData.platform) || navigator.platform || navigator.userAgent || "").toLowerCase();
+    if (/iphone|ipad|android/.test(navigator.userAgent.toLowerCase())) return null;
+    if (p.indexOf("mac") >= 0) return "mac";
+    if (p.indexOf("win") >= 0) return "windows";
+    if (p.indexOf("linux") >= 0 || p.indexOf("x11") >= 0) return "linux";
+    return null;
+  }
+  function mb(bytes) { return (bytes / 1048576).toFixed(1) + " MB"; }
+
+  var os = detectOS();
+  if (os) {
+    document.getElementById("main-label").textContent = "Download for " + names[os];
+    var card = document.querySelector('.platform[data-os="' + os + '"] a.dl');
+    if (card) card.classList.add("primary");
+  }
+
+  fetch("https://api.github.com/repos/" + repo + "/releases/latest", { headers: { Accept: "application/vnd.github+json" } })
+    .then(function (r) { if (!r.ok) throw new Error(r.status); return r.json(); })
+    .then(function (rel) {
+      var byEnding = {};
+      (rel.assets || []).forEach(function (a) {
+        Object.keys(sizeKey).concat(["-macos.zip"]).forEach(function (end) {
+          if (a.name.slice(-end.length) === end) byEnding[end] = a;
+        });
+      });
+      document.querySelectorAll("[data-asset]").forEach(function (link) {
+        var a = byEnding[link.getAttribute("data-asset")];
+        if (a) link.href = a.browser_download_url;
+      });
+      Object.keys(sizeKey).forEach(function (end) {
+        var el = document.querySelector('[data-size="' + sizeKey[end] + '"]');
+        if (el && byEnding[end]) el.textContent = mb(byEnding[end].size);
+      });
+      var date = new Date(rel.published_at).toLocaleDateString(undefined, { year: "numeric", month: "long", day: "numeric" });
+      var version = rel.tag_name;
+      document.getElementById("release-line").innerHTML =
+        'Latest: <a href="' + rel.html_url + '">' + version + "</a>, released " + date + ".";
+      var asset = os && byEnding[main[os]];
+      if (asset) {
+        document.getElementById("main-download").href = asset.browser_download_url;
+        document.getElementById("main-meta").innerHTML =
+          version + " · " + mb(asset.size) + ' · <a href="#download">Other platforms</a>';
+      } else {
+        document.getElementById("main-meta").innerHTML =
+          version + ' · macOS, Windows and Linux · <a href="#download">All downloads</a>';
+      }
+    })
+    .catch(function () { /* links already point at the releases page */ });
+})();
+</script>
+</body>
+</html>
