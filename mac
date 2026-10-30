@@ -5,9 +5,13 @@
 # remove it. Needs Apple's command-line tools (xcode-select --install).
 #
 #   ./mac setup        install Rust 1.98.1 into .cache/macos-toolchain
-#   ./mac build        build target/macos/release/OpenCeres.app (native egui app)
+#   ./mac build        build target/macos/release/OpenCeres Dev.app (native egui app)
 #   ./mac run          build, then open the app
-#   ./mac dmg          build, then make target/macos/release/OpenCeres-<version>.dmg
+#   ./mac dmg          build OpenCeres.app, then make target/macos/release/OpenCeres-<version>.dmg
+#
+# Local builds are named "OpenCeres Dev" with their own bundle ID, so Spotlight
+# and Launchpad never confuse them with an installed release. Only `dmg` (what
+# CI publishes) makes the plain "OpenCeres". Both share the same settings.
 #
 # OPENCERES_UNIVERSAL=1 builds one binary for both Apple Silicon and Intel Macs.
 #   ./mac <cmd...>     run any command with the toolchain on PATH
@@ -19,7 +23,13 @@ export RUSTUP_HOME="$ROOT/.cache/macos-toolchain/rustup"
 export CARGO_HOME="$ROOT/.cache/macos-toolchain/cargo"
 export CARGO_TARGET_DIR="$ROOT/target/macos"
 export PATH="$CARGO_HOME/bin:$PATH"
-APP="$CARGO_TARGET_DIR/release/OpenCeres.app"
+NAME="OpenCeres Dev"
+BUNDLE_ID=org.openceres.desktop.dev
+if [ "${1:-run}" = dmg ]; then
+  NAME=OpenCeres
+  BUNDLE_ID=org.openceres.desktop
+fi
+APP="$CARGO_TARGET_DIR/release/$NAME.app"
 
 setup() {
   [ -x "$CARGO_HOME/bin/cargo" ] && return
@@ -63,12 +73,12 @@ build() {
 <plist version="1.0">
 <dict>
   <key>CFBundleDevelopmentRegion</key><string>en</string>
-  <key>CFBundleDisplayName</key><string>OpenCeres</string>
+  <key>CFBundleDisplayName</key><string>$NAME</string>
   <key>CFBundleExecutable</key><string>openceres-desktop</string>
   <key>CFBundleIconFile</key><string>AppIcon</string>
-  <key>CFBundleIdentifier</key><string>org.openceres.desktop</string>
+  <key>CFBundleIdentifier</key><string>$BUNDLE_ID</string>
   <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
-  <key>CFBundleName</key><string>OpenCeres</string>
+  <key>CFBundleName</key><string>$NAME</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleShortVersionString</key><string>$version</string>
   <key>CFBundleVersion</key><string>$version</string>

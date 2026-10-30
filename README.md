@@ -112,8 +112,8 @@ Apple's command-line tools). Rust is installed only inside
 `.cache/macos-toolchain`; delete that folder to remove it.
 
 ```sh
-./mac run                        # build OpenCeres.app (about 5 MB) and open it
-./mac build                      # target/macos/release/OpenCeres.app
+./mac run                        # build "OpenCeres Dev.app" (about 5 MB) and open it
+./mac build                      # target/macos/release/OpenCeres Dev.app
 ```
 
 ## Releases

@@ -30,7 +30,7 @@ objects, measure positions, write MPC reports. Product priorities, in order:
 
 ```sh
 ./dev check                 # all crates: fmt --check, clippy -D warnings, tests (run before finishing)
-./mac run                   # desktop app: build and open OpenCeres.app on the Mac
+./mac run                   # desktop app: build and open "OpenCeres Dev.app" on the Mac
 ./dev cargo test -p openceres-core
 ./dev cargo run --release -p openceres-cli -- stars data/<file>.fits
 ```
