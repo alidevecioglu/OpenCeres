@@ -91,6 +91,182 @@ impl Status {
     }
 }
 
+/// A frame of the set as the search saw it, so marks can be matched to the
+/// same frame on another computer (where the order or paths may differ).
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct FrameRef {
+    /// File name, e.g. `o61317g0380o….fits`.
+    pub file: String,
+    /// `DATE-OBS`, the most reliable way to tell frames apart.
+    pub time: Option<String>,
+}
+
+/// One object a student marked, frame by frame (the detailed report).
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct Tagged {
+    /// `A`, `B`, … in the order they were marked.
+    pub label: String,
+    /// Position on each frame of [`Record::frames`] (same index), in that
+    /// frame's own 0-based FITS pixels; `None` where it was not marked.
+    pub at: Vec<Option<(f64, f64)>>,
+    /// Report box, row × column, on the first-frame grid.
+    pub cell: Option<(usize, usize)>,
+    /// Apparent motion in arcseconds per minute and its direction in
+    /// degrees east of north, when the frames have times and sky coordinates.
+    pub rate: Option<f64>,
+    pub direction: Option<f64>,
+    /// The known object it lines up with, e.g. `133105 2003 OG10`.
+    pub known: Option<String>,
+}
+
+impl Tagged {
+    pub fn marked(&self) -> usize {
+        self.at.iter().flatten().count()
+    }
+
+    /// e.g. `A · 2x3 · 0.64″/min · 249°`.
+    pub fn summary(&self) -> String {
+        let mut parts = vec![self.label.clone()];
+        if let Some(c) = self.cell {
+            parts.push(box_label(c));
+        }
+        if let Some(r) = self.rate {
+            parts.push(format!("{r:.2}″/min"));
+        }
+        if let Some(d) = self.direction {
+            parts.push(format!("{d:.0}°"));
+        }
+        parts.join(" · ")
+    }
+
+    /// `"label": …` and the rest, as one JSON object. `cutout(frame)` may
+    /// add a picture of each marked frame (see [`Record::to_json_with`]).
+    fn to_json(&self, indent: &str, cutout: &dyn Fn(usize) -> Option<String>) -> String {
+        let opt_num = |v: Option<f64>, digits: usize| {
+            v.map_or_else(|| "null".into(), |n| format!("{n:.digits$}"))
+        };
+        let positions: Vec<String> = self
+            .at
+            .iter()
+            .enumerate()
+            .filter_map(|(i, p)| {
+                let (x, y) = (*p)?;
+                let extra = cutout(i).map_or_else(String::new, |c| {
+                    format!(", \"cutout\": {}", json::quote(&c))
+                });
+                Some(format!(
+                    "{indent}      {{\"frame\": {}, \"x\": {x:.2}, \"y\": {y:.2}{extra}}}",
+                    i + 1
+                ))
+            })
+            .collect();
+        let fields = [
+            ("label", json::quote(&self.label)),
+            (
+                "box",
+                self.cell
+                    .map_or_else(|| "null".into(), |c| json::quote(&box_label(c))),
+            ),
+            ("rate", opt_num(self.rate, 3)),
+            ("direction", opt_num(self.direction, 1)),
+            (
+                "known",
+                self.known
+                    .as_deref()
+                    .map_or_else(|| "null".into(), json::quote),
+            ),
+            (
+                "positions",
+                if positions.is_empty() {
+                    "[]".into()
+                } else {
+                    format!("[\n{}\n{indent}    ]", positions.join(",\n"))
+                },
+            ),
+        ];
+        let body: Vec<String> = fields
+            .iter()
+            .map(|(k, v)| format!("{indent}    {}: {v}", json::quote(k)))
+            .collect();
+        format!("{{\n{}\n{indent}  }}", body.join(",\n"))
+    }
+
+    fn from_value(v: &Value, frames: usize) -> Option<Tagged> {
+        let label = v.get("label")?.as_str()?.trim().to_owned();
+        if label.is_empty() || label.len() > 8 {
+            return None;
+        }
+        let mut at = vec![None; frames];
+        for p in v.get("positions").and_then(Value::as_array).unwrap_or(&[]) {
+            let n = |k: &str| p.get(k).and_then(Value::as_f64).filter(|n| n.is_finite());
+            let (Some(f), Some(x), Some(y)) = (n("frame"), n("x"), n("y")) else {
+                continue;
+            };
+            if f >= 1.0 && (f as usize) <= frames {
+                at[f as usize - 1] = Some((x, y));
+            }
+        }
+        let num = |k: &str| v.get(k).and_then(Value::as_f64).filter(|n| n.is_finite());
+        Some(Tagged {
+            label,
+            at,
+            cell: v.get("box").and_then(Value::as_str).and_then(parse_box),
+            rate: num("rate"),
+            direction: num("direction"),
+            known: v.get("known").and_then(Value::as_str).map(str::to_owned),
+        })
+    }
+}
+
+/// For each frame of `from`, the frame of `to` that is the same exposure:
+/// matched by `DATE-OBS`, else by file name, else by position when both
+/// lists have the same length and nothing else matched.
+pub fn frame_map(from: &[FrameRef], to: &[FrameRef]) -> Vec<Option<usize>> {
+    let map: Vec<Option<usize>> = from
+        .iter()
+        .map(|f| {
+            to.iter()
+                .position(|t| f.time.is_some() && t.time == f.time)
+                .or_else(|| {
+                    to.iter()
+                        .position(|t| !f.file.is_empty() && t.file == f.file)
+                })
+        })
+        .collect();
+    if map.iter().all(Option::is_none) && from.len() == to.len() {
+        (0..from.len()).map(Some).collect()
+    } else {
+        map
+    }
+}
+
+/// `objects` with their positions moved to the frames `map` points at, out
+/// of `frames` frames in all.
+pub fn remap(objects: &[Tagged], map: &[Option<usize>], frames: usize) -> Vec<Tagged> {
+    objects
+        .iter()
+        .map(|o| {
+            let mut at = vec![None; frames];
+            for (i, p) in o.at.iter().enumerate() {
+                if let (Some(p), Some(Some(j))) = (p, map.get(i)) {
+                    at[*j] = Some(*p);
+                }
+            }
+            Tagged { at, ..o.clone() }
+        })
+        .collect()
+}
+
+/// Labels for marked objects: `A`…`Z`, then `AA`, `AB`, ….
+pub fn object_label(i: usize) -> String {
+    let letter = |n: usize| char::from(b'A' + (n % 26) as u8);
+    if i < 26 {
+        letter(i).to_string()
+    } else {
+        format!("{}{}", letter(i / 26 - 1), letter(i))
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct Record {
     /// Unique and file-name safe: `<set>-<created>-<random>`.
@@ -116,6 +292,10 @@ pub struct Record {
     pub known: Vec<String>,
     /// The files that were opened, so the search can be opened again.
     pub files: Vec<String>,
+    /// The set's frames in time order, which [`Tagged::at`] refers to.
+    pub frames: Vec<FrameRef>,
+    /// Objects marked frame by frame (the detailed report).
+    pub objects: Vec<Tagged>,
 }
 
 impl Record {
@@ -154,6 +334,7 @@ impl Record {
     /// does not add to the history.
     pub fn has_content(&self) -> bool {
         !self.boxes.is_empty()
+            || !self.objects.is_empty()
             || self.status != Status::Searching
             || !self.notes.trim().is_empty()
             || !self.designation.trim().is_empty()
@@ -164,11 +345,47 @@ impl Record {
     }
 
     pub fn to_json(&self, indent: &str) -> String {
+        self.to_json_with(indent, &|_, _| None)
+    }
+
+    /// [`Record::to_json`], with `cutout(object, frame)` adding a picture
+    /// (a `data:image/png;base64,…` URL) to each marked position that has one.
+    pub fn to_json_with(
+        &self,
+        indent: &str,
+        cutout: &dyn Fn(usize, usize) -> Option<String>,
+    ) -> String {
+        let frames: Vec<String> = self
+            .frames
+            .iter()
+            .enumerate()
+            .map(|(i, f)| {
+                let time = f.time.as_deref().map_or_else(|| "null".into(), json::quote);
+                format!(
+                    "{indent}    {{\"frame\": {}, \"file\": {}, \"time\": {time}}}",
+                    i + 1,
+                    json::quote(&f.file)
+                )
+            })
+            .collect();
+        let objects: Vec<String> = self
+            .objects
+            .iter()
+            .enumerate()
+            .map(|(i, o)| format!("{indent}  {}", o.to_json(indent, &|f| cutout(i, f))))
+            .collect();
+        let list = |items: &[String]| {
+            if items.is_empty() {
+                "[]".to_owned()
+            } else {
+                format!("[\n{}\n{indent}  ]", items.join(",\n"))
+            }
+        };
         let boxes: Vec<String> = self.boxes.iter().map(|&b| box_label(b)).collect();
         let opt = |v: &Option<String>| v.as_deref().map_or_else(|| "null".into(), json::quote);
         let fields = [
             ("format", json::quote(RECORD_FORMAT)),
-            ("version", "1".into()),
+            ("version", "2".into()),
             ("id", json::quote(&self.id)),
             ("set", json::quote(&self.set)),
             ("observed", opt(&self.observed)),
@@ -184,6 +401,8 @@ impl Record {
             ("notes", json::quote(&self.notes)),
             ("known", json::string_array(&self.known)),
             ("files", json::string_array(&self.files)),
+            ("frames", list(&frames)),
+            ("objects", list(&objects)),
             ("app", json::quote(crate::update::CURRENT_VERSION)),
         ];
         let body: Vec<String> = fields
@@ -224,6 +443,28 @@ impl Record {
             .filter(|&(r, c)| r <= grid && c <= grid)
             .collect();
         let created = number("created").unwrap_or(0);
+        let frames: Vec<FrameRef> = v
+            .get("frames")
+            .and_then(Value::as_array)
+            .unwrap_or(&[])
+            .iter()
+            .take(64)
+            .map(|f| FrameRef {
+                file: f
+                    .get("file")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned(),
+                time: f.get("time").and_then(Value::as_str).map(str::to_owned),
+            })
+            .collect();
+        let objects = v
+            .get("objects")
+            .and_then(Value::as_array)
+            .unwrap_or(&[])
+            .iter()
+            .filter_map(|o| Tagged::from_value(o, frames.len()))
+            .collect();
         Some(Record {
             id,
             set,
@@ -241,6 +482,8 @@ impl Record {
             notes: text("notes").unwrap_or_default(),
             known: list("known"),
             files: list("files"),
+            frames,
+            objects,
         })
     }
 }
@@ -510,7 +753,12 @@ pub struct Imported {
 /// Merges an export (or a single search file) into `dir`. A search that is
 /// already there is replaced only by a newer copy of itself.
 pub fn import(dir: &Path, text: &str) -> Result<Imported, String> {
-    let not_history = || "This file isn't an OpenCeres history export.".to_owned();
+    import_records(dir, read_records(text)?)
+}
+
+/// The searches in a history export or a single search (report) file.
+pub fn read_records(text: &str) -> Result<Vec<Record>, String> {
+    let not_history = || "This file isn't an OpenCeres report or history export.".to_owned();
     let root = json::parse(text.trim_start_matches('\u{feff}')).map_err(|_| not_history())?;
     let incoming: Vec<Record> = match root.get("records").and_then(Value::as_array) {
         Some(items) => items.iter().filter_map(Record::from_value).collect(),
@@ -519,6 +767,11 @@ pub fn import(dir: &Path, text: &str) -> Result<Imported, String> {
     if incoming.is_empty() {
         return Err(not_history());
     }
+    Ok(incoming)
+}
+
+/// Merges `incoming` into `dir` by id, keeping the newer copy.
+pub fn import_records(dir: &Path, incoming: Vec<Record>) -> Result<Imported, String> {
     let (existing, _) = load_all(dir)?;
     let mut result = Imported::default();
     for r in incoming {
@@ -557,6 +810,24 @@ mod tests {
             notes: "Faint, \"moving\" fast\nsecond line".into(),
             known: vec!["133105 2003 OG10".into()],
             files: vec!["/Users/me/Downloads/XY57_p01.zip".into()],
+            frames: vec![
+                FrameRef {
+                    file: "a.fits".into(),
+                    time: Some("2026-10-04T10:15:39.832".into()),
+                },
+                FrameRef {
+                    file: "b.fits".into(),
+                    time: None,
+                },
+            ],
+            objects: vec![Tagged {
+                label: "A".into(),
+                at: vec![Some((1128.25, 1841.5)), None],
+                cell: Some((3, 2)),
+                rate: Some(0.642),
+                direction: Some(249.5),
+                known: Some("133105 2003 OG10".into()),
+            }],
         }
     }
 
@@ -573,6 +844,54 @@ mod tests {
         let back = Record::from_value(&json::parse(&r.to_json("")).unwrap()).unwrap();
         assert_eq!(back, r);
         assert_eq!(r.report(), "XY57_p01: 1x4 2x3");
+    }
+
+    #[test]
+    fn objects_and_cutouts_in_json() {
+        let r = sample();
+        let text = r.to_json_with("", &|o, f| (o == 0 && f == 0).then(|| "data:x".into()));
+        assert!(text.contains(r#""cutout": "data:x""#), "{text}");
+        // Cutouts are for people; reading the file back ignores them.
+        let back = Record::from_value(&json::parse(&text).unwrap()).unwrap();
+        assert_eq!(back, r);
+        // Positions on frames the file doesn't list are dropped.
+        let v = json::parse(
+            r#"{"id":"a","set":"S","frames":[{"file":"f"}],"objects":[
+                {"label":"A","positions":[{"frame":1,"x":1,"y":2},{"frame":2,"x":3,"y":4}]},
+                {"label":""}]}"#,
+        )
+        .unwrap();
+        let r = Record::from_value(&v).unwrap();
+        assert_eq!(r.objects.len(), 1);
+        assert_eq!(r.objects[0].at, [Some((1.0, 2.0))]);
+        assert_eq!(r.objects[0].summary(), "A");
+        assert_eq!(
+            (object_label(0), object_label(25), object_label(26)),
+            ("A".into(), "Z".into(), "AA".into())
+        );
+    }
+
+    #[test]
+    fn frames_match_by_time_then_name() {
+        let f = |file: &str, time: Option<&str>| FrameRef {
+            file: file.into(),
+            time: time.map(str::to_owned),
+        };
+        let theirs = [f("a", Some("t1")), f("b", Some("t2")), f("c", None)];
+        let ours = [f("x", Some("t2")), f("c", None), f("y", Some("t1"))];
+        assert_eq!(frame_map(&theirs, &ours), [Some(2), Some(0), Some(1)]);
+        // Nothing in common but the same count: same order.
+        assert_eq!(
+            frame_map(&[f("p", None), f("q", None)], &[f("r", None), f("s", None)]),
+            [Some(0), Some(1)]
+        );
+        let o = Tagged {
+            label: "A".into(),
+            at: vec![Some((1.0, 1.0)), Some((2.0, 2.0)), None],
+            ..Tagged::default()
+        };
+        let moved = remap(&[o], &frame_map(&theirs, &ours), 3);
+        assert_eq!(moved[0].at, [Some((2.0, 2.0)), None, Some((1.0, 1.0))]);
     }
 
     #[test]

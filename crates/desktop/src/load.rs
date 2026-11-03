@@ -46,7 +46,8 @@ pub struct Frame {
     /// stars (the identity for the first frame). `None` if too few stars
     /// matched; the frame is then shown as it is.
     pub to_reference: Option<Affine>,
-    name: String,
+    /// File name, without the folder.
+    pub name: String,
 }
 
 pub struct ImageSet {
@@ -136,7 +137,7 @@ fn too_many(n: usize) -> String {
     format!("An image set has at most {MAX_IMAGES} images (got {n}).")
 }
 
-fn load(source: Source) -> Result<Frame, String> {
+fn read(source: Source) -> Result<(String, fits::Image), String> {
     let (name, image) = match source {
         Source::File(path) => (file_name(&path), fits::read(&path)),
         // The zip entry's bytes are dropped as soon as they are parsed.
@@ -149,7 +150,11 @@ fn load(source: Source) -> Result<Frame, String> {
     if image.width == 0 || image.height == 0 {
         return Err(format!("{name}: image is empty"));
     }
+    Ok((name, image))
+}
 
+fn load(source: Source) -> Result<Frame, String> {
+    let (name, image) = read(source)?;
     let bg = detect::background(&image);
     let gray = render::grayscale(&image, render::Stretch::auto(bg));
     let wcs = Wcs::from_header(&image.header);
@@ -248,6 +253,67 @@ fn align_frames(frames: &mut [Frame]) {
     });
 }
 
+/// A square to cut from one frame for a detailed report.
+pub struct CutoutRequest {
+    /// The frame's file name ([`Frame::name`]).
+    pub file: String,
+    /// Centre in that frame's 0-based FITS pixels.
+    pub x: f64,
+    pub y: f64,
+    /// Side in pixels (odd, so the centre pixel is in the middle).
+    pub size: usize,
+}
+
+/// Cuts the requested squares from the frames exactly as they are shown
+/// (same stretch), reading the set's files again one frame at a time: the
+/// app keeps no pixels after uploading them, and this runs rarely. Returns
+/// a grayscale square per request (top row first; black outside the
+/// frame), `None` where the frame was not found.
+pub fn cutouts(
+    paths: &[String],
+    requests: &[CutoutRequest],
+) -> Result<Vec<Option<Vec<u8>>>, String> {
+    let (_, sources) = collect(paths)?;
+    let mut out: Vec<Option<Vec<u8>>> = requests.iter().map(|_| None).collect();
+    for source in sources {
+        let name = match &source {
+            Source::File(p) => file_name(p),
+            Source::Bytes(n, _) => n.clone(),
+        };
+        if !requests.iter().any(|r| r.file == name) {
+            continue;
+        }
+        let (_, image) = read(source)?;
+        let gray = render::grayscale(&image, render::Stretch::auto(detect::background(&image)));
+        for (slot, r) in out.iter_mut().zip(requests).filter(|(_, r)| r.file == name) {
+            *slot = Some(cut(&gray, image.width, image.height, r));
+        }
+    }
+    release_freed_memory();
+    Ok(out)
+}
+
+fn cut(gray: &[u8], width: usize, height: usize, r: &CutoutRequest) -> Vec<u8> {
+    let half = (r.size / 2) as i64;
+    let (cx, cy) = (r.x.round() as i64, r.y.round() as i64);
+    let mut out = vec![0u8; r.size * r.size];
+    for j in 0..r.size as i64 {
+        // Top row of the cutout = highest y; `gray` stores the top row first.
+        let y = cy + half - j;
+        if y < 0 || y >= height as i64 {
+            continue;
+        }
+        let row = (height as i64 - 1 - y) as usize * width;
+        for i in 0..r.size as i64 {
+            let x = cx - half + i;
+            if x >= 0 && x < width as i64 {
+                out[(j * r.size as i64 + i) as usize] = gray[row + x as usize];
+            }
+        }
+    }
+    out
+}
+
 /// Loading needs several hundred MB of temporary images. The allocator keeps
 /// freed large blocks around for reuse (macOS returns them lazily, glibc
 /// raises its mmap threshold), so ask it to give them back to the system now.
@@ -274,6 +340,30 @@ fn release_freed_memory() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cutouts_follow_fits_orientation() {
+        // 4 × 3 image, top row first in `gray`: FITS (x, y) holds 10 y + x.
+        let (w, h) = (4, 3);
+        let gray: Vec<u8> = (0..h)
+            .rev()
+            .flat_map(|y| (0..w).map(move |x| (10 * y + x) as u8))
+            .collect();
+        let r = CutoutRequest {
+            file: String::new(),
+            x: 1.0,
+            y: 1.0,
+            size: 3,
+        };
+        // Top row of the cutout is y = 2.
+        assert_eq!(cut(&gray, w, h, &r), [20, 21, 22, 10, 11, 12, 0, 1, 2]);
+        let corner = CutoutRequest {
+            x: 0.0,
+            y: 0.0,
+            ..r
+        };
+        assert_eq!(cut(&gray, w, h, &corner), [0, 10, 11, 0, 0, 1, 0, 0, 0]);
+    }
 
     #[test]
     fn rejects_other_files_and_large_sets() {

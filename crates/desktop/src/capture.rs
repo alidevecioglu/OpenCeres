@@ -19,7 +19,11 @@
 //! them a folder), `paused`, `frame=N`
 //! (1-based), `mark=RxC` (row × column, repeatable), `gridsize=N`, `known`
 //! (look up known objects and wait for the answer), `focus=LABEL` (centre
-//! and zoom on that known object, where it is on the first frame) and `size=WxH` (window size in points).
+//! and zoom on that known object, where it is on the first frame),
+//! `objects=FILE` (a report's objects as the student's own), `marking`
+//! (continue marking the last of them), `report=FILE` (import a student's
+//! report to review), `export=FILE` (write the detailed report with cutouts
+//! there; needs `OPENCERES_HISTORY_DIR`) and `size=WxH` (window size in points).
 
 use eframe::egui;
 
@@ -45,6 +49,10 @@ pub struct State {
     pub grid_size: Option<usize>,
     /// Report boxes as (row, column).
     pub marks: Vec<(usize, usize)>,
+    pub objects: Option<String>,
+    pub marking: bool,
+    pub report: Option<String>,
+    pub export: Option<String>,
     pub size: Option<[f32; 2]>,
 }
 
@@ -109,6 +117,10 @@ impl State {
                 "frame" => s.frame = value.parse().ok(),
                 "gridsize" => s.grid_size = value.parse().ok(),
                 "mark" => s.marks.extend(pair(value)),
+                "objects" => s.objects = Some(value.to_owned()),
+                "marking" => s.marking = true,
+                "report" => s.report = Some(value.to_owned()),
+                "export" => s.export = Some(value.to_owned()),
                 "size" => {
                     s.size = pair(value).map(|(w, h)| [w as f32, h as f32]);
                 }
@@ -119,11 +131,9 @@ impl State {
     }
 }
 
-/// Writes an 8-bit RGBA PNG: one IDAT chunk, no filtering. Enough for
-/// screenshots; not meant to be small.
 pub fn write_png(path: &str, image: &egui::ColorImage) -> std::io::Result<()> {
     let [w, h] = image.size;
-    std::fs::write(path, encode_png(w, h, &rgba(image)))
+    std::fs::write(path, crate::png::encode_rgba(w, h, &rgba(image)))
 }
 
 fn rgba(image: &egui::ColorImage) -> Vec<u8> {
@@ -134,63 +144,9 @@ fn rgba(image: &egui::ColorImage) -> Vec<u8> {
         .collect()
 }
 
-pub fn encode_png(width: usize, height: usize, rgba: &[u8]) -> Vec<u8> {
-    let mut raw = Vec::with_capacity((width * 4 + 1) * height);
-    for row in rgba.chunks_exact(width * 4).take(height) {
-        raw.push(0); // filter type: none
-        raw.extend_from_slice(row);
-    }
-    let mut ihdr = Vec::with_capacity(13);
-    ihdr.extend_from_slice(&(width as u32).to_be_bytes());
-    ihdr.extend_from_slice(&(height as u32).to_be_bytes());
-    ihdr.extend_from_slice(&[8, 6, 0, 0, 0]); // 8-bit, RGBA, deflate, adaptive, no interlace
-    let mut out = b"\x89PNG\r\n\x1a\n".to_vec();
-    chunk(&mut out, b"IHDR", &ihdr);
-    chunk(
-        &mut out,
-        b"IDAT",
-        &miniz_oxide::deflate::compress_to_vec_zlib(&raw, 6),
-    );
-    chunk(&mut out, b"IEND", &[]);
-    out
-}
-
-fn chunk(out: &mut Vec<u8>, kind: &[u8; 4], data: &[u8]) {
-    out.extend_from_slice(&(data.len() as u32).to_be_bytes());
-    let start = out.len();
-    out.extend_from_slice(kind);
-    out.extend_from_slice(data);
-    let crc = crc32(&out[start..]);
-    out.extend_from_slice(&crc.to_be_bytes());
-}
-
-fn crc32(bytes: &[u8]) -> u32 {
-    let mut crc = !0u32;
-    for &b in bytes {
-        crc ^= u32::from(b);
-        for _ in 0..8 {
-            crc = (crc >> 1) ^ (0xedb8_8320 & (crc & 1).wrapping_neg());
-        }
-    }
-    !crc
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn png_structure() {
-        assert_eq!(crc32(b"IEND"), 0xae42_6082);
-        let png = encode_png(2, 1, &[255, 0, 0, 255, 0, 0, 255, 255]);
-        assert!(png.starts_with(b"\x89PNG\r\n\x1a\n"));
-        assert!(png.ends_with(&[0, 0, 0, 0, b'I', b'E', b'N', b'D', 0xae, 0x42, 0x60, 0x82]));
-        let idat = png.windows(4).position(|w| w == b"IDAT").unwrap();
-        let len = u32::from_be_bytes(png[idat - 4..idat].try_into().unwrap()) as usize;
-        let raw =
-            miniz_oxide::inflate::decompress_to_vec_zlib(&png[idat + 4..idat + 4 + len]).unwrap();
-        assert_eq!(raw, [0, 255, 0, 0, 255, 0, 0, 255, 255]);
-    }
 
     #[test]
     fn parses_state() {

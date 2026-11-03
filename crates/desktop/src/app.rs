@@ -2,6 +2,7 @@
 //! window), an optional report side panel and a slim status bar.
 
 pub(crate) mod history_ui;
+mod objects_ui;
 pub(crate) mod settings_ui;
 
 use std::path::PathBuf;
@@ -17,7 +18,7 @@ use eframe::egui::{
 use crate::capture::{self, Capture};
 use crate::format;
 use crate::gpu::{Draw, Gpu};
-use crate::history::{self, Record, box_label, report_line};
+use crate::history::{self, Record, Tagged, box_label, report_line};
 use crate::icons::{self, Icon};
 use crate::known::{self, Catalogue, Download, Fetched, Freshness, Lookup, LookupError};
 use crate::load::{self, Frame as ImageFrame, ImageSet};
@@ -167,6 +168,17 @@ pub struct App {
     /// Marked report boxes as (row, column), 1-based from the top-left.
     marks: Vec<(usize, usize)>,
     copied: bool,
+    /// Objects marked frame by frame (the detailed report), indexed like
+    /// the set's frames.
+    objects: Vec<Tagged>,
+    /// The object being marked (index into `objects`).
+    marking: Option<usize>,
+    report_note: Option<String>,
+    report_error: Option<String>,
+    export: Option<objects_ui::Export>,
+    /// Other students' reports of the open set, shown over the images.
+    reviews: Vec<objects_ui::Review>,
+    review_note: Option<String>,
     /// Known objects shown (session toggle, K).
     known_on: bool,
     known: Option<KnownState>,
@@ -220,6 +232,8 @@ fn shortcuts() -> Vec<(Vec<String>, &'static str)> {
         (keys(&["I"]), "Invert"),
         (keys(&["A"]), "Align frames on the stars"),
         (keys(&["G"]), "Report grid (click a box to mark it)"),
+        (keys(&["M"]), "Mark a moving object on each frame"),
+        (keys(&["Enter"]), "While marking: use the predicted spot"),
         (keys(&["K"]), "Known objects in the field"),
         (keys(&["H"]), "Search history"),
         (keys(&["Tab"]), "Side panel (or \\)"),
@@ -278,6 +292,13 @@ impl App {
             grid_size: prefs.grid_size,
             marks: Vec::new(),
             copied: false,
+            objects: Vec::new(),
+            marking: None,
+            report_note: None,
+            report_error: None,
+            export: None,
+            reviews: Vec::new(),
+            review_note: None,
             known_on: prefs.show_known,
             known: None,
             known_focus: None,
@@ -401,6 +422,12 @@ impl App {
                 });
                 self.marks.clear();
                 self.copied = false;
+                self.objects.clear();
+                self.marking = None;
+                self.reviews.clear();
+                self.report_note = None;
+                self.report_error = None;
+                self.review_note = None;
                 self.known = None;
                 self.known_focus = None;
                 self.index = 0;
@@ -872,6 +899,9 @@ impl App {
                         self.settings_open = false;
                         self.searches.window_open = false;
                         handled = true;
+                    } else if key == Key::Escape && self.marking.is_some() {
+                        self.finish_marking();
+                        handled = true;
                     }
                     if self.modal_open() || modifiers.alt || command {
                         continue;
@@ -887,6 +917,10 @@ impl App {
                         }
                         Key::ArrowRight => {
                             self.step(1);
+                            true
+                        }
+                        Key::Enter if self.marking.is_some() => {
+                            self.accept_prediction();
                             true
                         }
                         Key::Tab if !modifiers.shift => {
@@ -907,6 +941,7 @@ impl App {
                         "i" | "I" => self.invert = !self.invert,
                         "a" | "A" => self.align_on = !self.align_on,
                         "g" | "G" => self.set_grid(!self.grid_on),
+                        "m" | "M" if self.set.is_some() => self.start_marking(),
                         "k" | "K" => self.set_known(!self.known_on),
                         "h" | "H" => self.toggle_history(),
                         "," | "[" => self.change_speed(1, now),
@@ -974,7 +1009,10 @@ impl App {
             return;
         }
         ctx.request_repaint();
-        if self.loading.is_some() || matches!(self.known, Some(KnownState::Pending(_))) {
+        if self.loading.is_some()
+            || self.export.is_some()
+            || matches!(self.known, Some(KnownState::Pending(_)))
+        {
             return;
         }
         cap.frames += 1;
@@ -1026,6 +1064,31 @@ impl App {
         }
         if let Some(n) = s.frame.filter(|&n| n >= 1 && n <= self.frame_count()) {
             self.index = n - 1;
+        }
+        let read = |path: &str| {
+            std::fs::read_to_string(path)
+                .map_err(|e| e.to_string())
+                .and_then(|t| history::read_records(&t))
+        };
+        if let Some(Ok(records)) = s.objects.as_deref().map(read)
+            && let Some(r) = records.first()
+        {
+            let ours = self.frame_refs();
+            let map = history::frame_map(&r.frames, &ours);
+            self.objects = history::remap(&r.objects, &map, ours.len());
+        }
+        if s.marking && !self.objects.is_empty() {
+            let last = self.objects.len() - 1;
+            self.marking = Some(last);
+            if let Some(i) = self.objects[last].at.iter().position(Option::is_none) {
+                self.index = i;
+            }
+        }
+        if let Some(Ok(records)) = s.report.as_deref().map(read) {
+            self.review_note = Some(self.show_reports(records));
+        }
+        if let Some(path) = s.export {
+            self.write_report(ctx, PathBuf::from(path), true);
         }
         self.settings_open = s.settings;
         if let Some(set) = s.history {
@@ -1331,7 +1394,7 @@ impl App {
             });
     }
 
-    fn side_panel(&mut self, ui: &mut egui::Ui) {
+    fn side_panel(&mut self, ui: &mut egui::Ui, frame: &eframe::Frame) {
         if !self.prefs.panel_open {
             return;
         }
@@ -1346,43 +1409,66 @@ impl App {
                 bottom: S3 as i8,
             }))
             .show(ui, |ui| {
-                ui.spacing_mut().item_spacing.y = S2;
-                let count = (!self.marks.is_empty()).then_some(self.marks.len());
-                section_heading(ui, "Easy report", count);
-                self.report_section(ui);
-                if self.set.is_some() && self.searches.record.is_some() {
-                    ui.add_space(S3);
-                    hline(ui, p.border);
-                    ui.add_space(S2);
-                    self.search_section(ui);
-                }
-                if self.known_on {
-                    ui.add_space(S3);
-                    hline(ui, p.border);
-                    ui.add_space(S2);
-                    let count = match &self.known {
-                        Some(KnownState::Done(k)) => Some(k.objects.len()),
-                        _ => None,
-                    };
-                    section_heading(ui, "Known objects", count);
-                    self.known_section(ui);
-                }
-                ui.add_space(S3);
-                hline(ui, p.border);
-                ui.add_space(S2);
-                section_heading(ui, "Candidates", None);
-                ui.add(
-                    Label::new(
-                        RichText::new(
-                            "Automatic detection is coming. For now, blink and look for \
-                             anything that moves.",
-                        )
-                        .small()
-                        .color(p.muted),
-                    )
-                    .wrap(),
-                );
+                // Scrolls when the sections don't fit (small windows).
+                egui::ScrollArea::vertical()
+                    .id_salt("panel_scroll")
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| self.panel_sections(ui, frame));
             });
+    }
+
+    fn panel_sections(&mut self, ui: &mut egui::Ui, frame: &eframe::Frame) {
+        let p = palette(ui);
+        ui.spacing_mut().item_spacing.y = S2;
+        let count = (!self.marks.is_empty()).then_some(self.marks.len());
+        section_heading(ui, "Easy report", count);
+        self.report_section(ui);
+        ui.add_space(S3);
+        hline(ui, p.border);
+        ui.add_space(S2);
+        let count = (!self.objects.is_empty()).then_some(self.objects.len());
+        section_heading(ui, "Objects", count);
+        self.objects_section(ui, frame);
+        if self.set.is_some() && self.searches.record.is_some() {
+            ui.add_space(S3);
+            hline(ui, p.border);
+            ui.add_space(S2);
+            self.search_section(ui);
+        }
+        if self.known_on {
+            ui.add_space(S3);
+            hline(ui, p.border);
+            ui.add_space(S2);
+            let count = match &self.known {
+                Some(KnownState::Done(k)) => Some(k.objects.len()),
+                _ => None,
+            };
+            section_heading(ui, "Known objects", count);
+            self.known_section(ui);
+        }
+        if self.set.is_some() {
+            ui.add_space(S3);
+            hline(ui, p.border);
+            ui.add_space(S2);
+            let count = (!self.reviews.is_empty()).then_some(self.reviews.len());
+            section_heading(ui, "Students' reports", count);
+            self.reviews_section(ui, frame);
+        }
+        ui.add_space(S3);
+        hline(ui, p.border);
+        ui.add_space(S2);
+        section_heading(ui, "Candidates", None);
+        ui.add(
+            Label::new(
+                RichText::new(
+                    "Automatic detection is coming. For now, blink and look for \
+                     anything that moves.",
+                )
+                .small()
+                .color(p.muted),
+            )
+            .wrap(),
+        );
     }
 
     fn report_section(&mut self, ui: &mut egui::Ui) {
@@ -1474,6 +1560,7 @@ impl App {
             ui.painter().rect_filled(rect, 0.0, theme::STAGE);
             self.viewer(ui, rect, &response);
             self.badge(ui, rect);
+            self.marking_hint(ui, rect);
         } else {
             ui.painter().rect_filled(rect, 0.0, palette(ui).bg);
             self.hover = None;
@@ -1535,7 +1622,11 @@ impl App {
         if let Some(pos) = pick {
             let uv = (pos - rect.min - self.view.offset) / self.view.scale;
             if uv.x >= 0.0 && uv.y >= 0.0 && uv.x < w && uv.y < h {
-                self.toggle_mark(uv.x / w, uv.y / h);
+                if self.marking.is_some() {
+                    self.place_mark(f64::from(uv.x) - 0.5, f64::from(h - uv.y) - 0.5);
+                } else {
+                    self.toggle_mark(uv.x / w, uv.y / h);
+                }
             }
         }
         if hovered {
@@ -1615,6 +1706,7 @@ impl App {
         if self.known_on {
             self.paint_known(&painter, rect, origin, h);
         }
+        self.paint_objects(&painter, rect, origin, h);
     }
 
     /// A ring (at least 6″ across the radius) and a `133105 · 19.0` chip for
@@ -1855,7 +1947,19 @@ impl App {
         let cell = image.size() / n as f32;
         for &(r, c) in &self.marks {
             let min = image.min + vec2((c - 1) as f32 * cell.x, (r - 1) as f32 * cell.y);
-            painter.rect_filled(Rect::from_min_size(min, cell), 0.0, theme::GRID_FILL);
+            let rect = Rect::from_min_size(min, cell);
+            if self.marking.is_some() {
+                // The fill would hide faint objects while marking them; an
+                // outline still shows which boxes are marked.
+                painter.rect_stroke(
+                    rect.shrink(1.0),
+                    0.0,
+                    Stroke::new(2.0, theme::GRID_TEXT),
+                    StrokeKind::Inside,
+                );
+            } else {
+                painter.rect_filled(rect, 0.0, theme::GRID_FILL);
+            }
         }
         let stroke = Stroke::new(1.0, theme::GRID_LINE);
         for i in 0..=n {
@@ -2061,6 +2165,7 @@ impl eframe::App for App {
         }
         self.poll_known();
         self.ensure_known(&ctx);
+        self.poll_export();
         self.drive_capture(&ctx);
         if let Some(e) = self.gpu.take_error() {
             self.error = Some(e);
@@ -2081,7 +2186,7 @@ impl eframe::App for App {
         self.toolbar(ui, frame);
         self.error_banner(ui);
         self.status_bar(ui);
-        self.side_panel(ui);
+        self.side_panel(ui, frame);
         egui::CentralPanel::no_frame().show(ui, |ui| self.stage(ui, frame));
         self.settings_window(&ctx, now);
         self.history_window(&ctx, frame);

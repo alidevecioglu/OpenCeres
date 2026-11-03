@@ -70,6 +70,7 @@ impl App {
     /// note who else searched it.
     pub(super) fn start_search(&mut self) {
         let resume_id = self.searches.resume_id.take();
+        let frame_refs = self.frame_refs();
         let h = &mut self.searches;
         h.record = None;
         h.saved = None;
@@ -115,6 +116,14 @@ impl App {
                 h.others.push(who.to_owned());
             }
         }
+        // Other students' detailed reports of this set (from a shared folder
+        // or imports) are shown over the images.
+        let reviews: Vec<Record> = same
+            .iter()
+            .filter(|r| !r.objects.is_empty())
+            .filter(|r| previous.is_none_or(|p| p.id != r.id) && !r.is_by(owner))
+            .map(|r| (*r).clone())
+            .collect();
         let record = match previous {
             Some(prev) => {
                 h.saved = Some(prev.clone());
@@ -123,6 +132,9 @@ impl App {
                 r.files = paths; // where the images are now
                 r.observed = r.observed.or(observed);
                 r.observatory = r.observatory.or(observatory);
+                let map = history::frame_map(&r.frames, &frame_refs);
+                r.objects = history::remap(&r.objects, &map, frame_refs.len());
+                r.frames.clone_from(&frame_refs);
                 r
             }
             None => {
@@ -130,6 +142,7 @@ impl App {
                 r.observed = observed;
                 r.observatory = observatory;
                 r.files = paths;
+                r.frames.clone_from(&frame_refs);
                 r
             }
         };
@@ -141,8 +154,12 @@ impl App {
             if !self.marks.is_empty() {
                 self.set_grid(true);
             }
+            self.objects.clone_from(&record.objects);
         }
         self.searches.record = Some(record);
+        for r in reviews {
+            self.add_review(r);
+        }
     }
 
     /// Forgets the open set's earlier search and starts a new one.
@@ -153,11 +170,14 @@ impl App {
         r.observed.clone_from(&old.observed);
         r.observatory.clone_from(&old.observatory);
         r.files.clone_from(&old.files);
+        r.frames.clone_from(&old.frames);
         h.record = Some(r);
         h.saved = None;
         h.resumed = None;
         self.marks.clear();
         self.copied = false;
+        self.objects.clear();
+        self.marking = None;
     }
 
     /// Copying the report counts as reporting it.
@@ -175,6 +195,7 @@ impl App {
         let h = &mut self.searches;
         let Some(r) = &mut h.record else { return };
         r.boxes.clone_from(&self.marks);
+        r.objects.clone_from(&self.objects);
         r.grid = self.grid_size;
         if let Some(KnownState::Done(k)) = &self.known {
             let names: Vec<String> = k.objects.iter().map(|o| known_name(&o.object)).collect();
@@ -792,7 +813,7 @@ impl App {
 }
 
 /// `133105 2003 OG10`, or the name alone for unnumbered objects.
-fn known_name(o: &KnownObject) -> String {
+pub(super) fn known_name(o: &KnownObject) -> String {
     match &o.number {
         Some(n) => format!("{n} {}", o.name),
         None => o.name.clone(),

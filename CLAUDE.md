@@ -62,6 +62,12 @@ objects, measure positions, write MPC reports. Product priorities, in order:
   CSV/JSON export. UI in `app/history_ui.rs`; `json.rs` is the shared
   hand-written parser/writer. Screenshots only touch the history when
   `OPENCERES_HISTORY_DIR` is set.
+- `crates/desktop/src/app/objects_ui.rs` — detailed report: students mark
+  each moving object frame by frame (snap to sources, predicted position),
+  export the search as JSON with or without PNG cutouts; teachers import
+  students' reports and see their tracks on the open set. Marks are stored
+  in each frame's own pixels plus `frames` (file, DATE-OBS) so they map onto
+  another computer's copy of the set.
 - `crates/desktop/` — the desktop app: egui/eframe with the glow (OpenGL)
   backend, no web technology (user requirement: minimum resource use).
   Frames are R8 textures drawn by a small shader (invert is a uniform);

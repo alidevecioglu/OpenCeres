@@ -13,6 +13,7 @@ mod icons;
 mod json;
 mod known;
 mod load;
+mod png;
 mod prefs;
 mod settings;
 mod theme;

@@ -95,6 +95,16 @@ pub const KNOWN: Color32 = rgb(0x3ddc97);
 pub const KNOWN_HALO: Color32 = Color32::from_rgba_premultiplied(0, 0, 0, 150);
 pub const KNOWN_TEXT: Color32 = rgb(0x7af0bd);
 pub const OVERLAY_TEXT: Color32 = rgb(0xf1f3f6);
+/// Objects the student marked (detailed report), and the colours other
+/// students' reports are shown in, in turn.
+pub const TAG: Color32 = rgb(0xff6fb5);
+pub const REVIEW: [Color32; 5] = [
+    rgb(0xb48cff),
+    rgb(0xff9b5e),
+    rgb(0xc6f25a),
+    rgb(0x5ee0d0),
+    rgb(0xff7a8a),
+];
 
 pub fn palette(ui: &egui::Ui) -> &'static Palette {
     if ui.visuals().dark_mode {
