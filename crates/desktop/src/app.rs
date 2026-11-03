@@ -25,6 +25,7 @@ use crate::prefs::{GRID_SIZES, KnownSource, Prefs, SPEEDS, ThemeChoice};
 use crate::settings::Category;
 use crate::theme::{self, S1, S2, S3, S4, S5, palette};
 use crate::update;
+use openceres_core::align::Affine;
 use openceres_core::known::KnownObject;
 
 const MAX_SCALE: f32 = 32.0;
@@ -159,6 +160,8 @@ pub struct App {
     blink_seconds: f32,
     show_stars: bool,
     invert: bool,
+    /// Frames drawn aligned on their stars (session toggle, A).
+    align_on: bool,
     grid_on: bool,
     grid_size: usize,
     /// Marked report boxes as (row, column), 1-based from the top-left.
@@ -215,6 +218,7 @@ fn shortcuts() -> Vec<(Vec<String>, &'static str)> {
         (keys(&["+", "−", "0"]), "Zoom in / out, fit"),
         (keys(&["S"]), "Detected stars"),
         (keys(&["I"]), "Invert"),
+        (keys(&["A"]), "Align frames on the stars"),
         (keys(&["G"]), "Report grid (click a box to mark it)"),
         (keys(&["K"]), "Known objects in the field"),
         (keys(&["H"]), "Search history"),
@@ -245,6 +249,12 @@ impl App {
                 None => {}
             }
             prefs.panel_open |= c.state.panel;
+            // Captures turn these on themselves, and must not depend on SkyBoT.
+            prefs.show_grid = false;
+            prefs.show_known = false;
+        } else {
+            // The report and the known-object list live in the side panel.
+            prefs.panel_open |= prefs.show_grid || prefs.show_known;
         }
         let searches = Searches {
             config: history::Config::load(),
@@ -263,11 +273,12 @@ impl App {
             blink_seconds: prefs.blink_seconds,
             show_stars: prefs.show_stars,
             invert: prefs.invert,
-            grid_on: false,
+            align_on: prefs.align,
+            grid_on: prefs.show_grid,
             grid_size: prefs.grid_size,
             marks: Vec::new(),
             copied: false,
-            known_on: false,
+            known_on: prefs.show_known,
             known: None,
             known_focus: None,
             download: None,
@@ -702,6 +713,45 @@ impl App {
         if p.grid_size != before.grid_size {
             self.set_grid_size(p.grid_size);
         }
+        if p.align != before.align {
+            self.align_on = p.align;
+        }
+        if p.show_grid != before.show_grid {
+            self.set_grid(p.show_grid);
+        }
+        if p.show_known != before.show_known {
+            self.set_known(p.show_known);
+        }
+    }
+
+    /// Where frame `i`'s pixels go in the view: onto the first frame's
+    /// pixels when aligning (and the frame could be aligned), else nowhere
+    /// different.
+    fn placement(&self, i: usize) -> Affine {
+        self.set
+            .as_ref()
+            .and_then(|s| s.frames.get(i))
+            .and_then(|f| f.to_reference)
+            .filter(|_| self.align_on)
+            .unwrap_or(Affine::IDENTITY)
+    }
+
+    /// Size in pixels of the grid the view shows: the first frame's when
+    /// aligning, so the view, grid and marks stay put while blinking.
+    fn view_size(&self) -> Option<(f32, f32)> {
+        let set = self.set.as_ref()?;
+        let f = if self.align_on {
+            set.frames.first()
+        } else {
+            set.frames.get(self.index)
+        }?;
+        Some((f.width as f32, f.height as f32))
+    }
+
+    /// Known object position on frame `i`, in view pixels.
+    fn known_at(&self, o: &Placed, i: usize) -> Option<(f64, f64)> {
+        let (x, y) = o.at.get(i).copied().flatten()?;
+        Some(self.placement(i).apply(x, y))
     }
 
     fn start_download(&mut self, ctx: &egui::Context) {
@@ -719,15 +769,13 @@ impl App {
             return;
         };
         let Some(o) = k.objects.get(i) else { return };
-        let Some((x, y)) =
-            o.at.get(self.index)
-                .copied()
-                .flatten()
-                .or_else(|| o.at.iter().find_map(|p| *p))
+        let Some((x, y)) = self
+            .known_at(o, self.index)
+            .or_else(|| (0..o.at.len()).find_map(|j| self.known_at(o, j)))
         else {
             return;
         };
-        let Some(h) = self.current().map(|f| f.height as f32) else {
+        let Some((_, h)) = self.view_size() else {
             return;
         };
         self.known_focus = Some(i);
@@ -738,8 +786,9 @@ impl App {
     }
 
     fn fit(&mut self) {
-        let Some(f) = self.current() else { return };
-        let (w, h) = (f.width as f32, f.height as f32);
+        let Some((w, h)) = self.view_size() else {
+            return;
+        };
         let stage = self.view.stage;
         let scale = fit_scale(stage, w, h);
         self.view.scale = scale;
@@ -764,8 +813,10 @@ impl App {
 
     /// Zooms by `factor` keeping the stage point `at` fixed (default: the centre).
     fn zoom_by(&mut self, factor: f32, at: Option<Vec2>) {
-        let Some(f) = self.current() else { return };
-        let min = fit_scale(self.view.stage, f.width as f32, f.height as f32) / 4.0;
+        let Some((w, h)) = self.view_size() else {
+            return;
+        };
+        let min = fit_scale(self.view.stage, w, h) / 4.0;
         let v = &mut self.view;
         v.auto_fit = false;
         let at = at.unwrap_or(v.stage / 2.0);
@@ -854,6 +905,7 @@ impl App {
                         "0" => self.fit(),
                         "s" | "S" => self.show_stars = !self.show_stars,
                         "i" | "I" => self.invert = !self.invert,
+                        "a" | "A" => self.align_on = !self.align_on,
                         "g" | "G" => self.set_grid(!self.grid_on),
                         "k" | "K" => self.set_known(!self.known_on),
                         "h" | "H" => self.toggle_history(),
@@ -934,7 +986,11 @@ impl App {
             if let Some(KnownState::Done(k)) = &self.known
                 && let Some(i) = k.objects.iter().position(|o| o.object.label() == label)
             {
+                // Where it is on the first frame, so captures of different
+                // frames show the same patch of sky.
+                let index = std::mem::replace(&mut self.index, 0);
                 self.focus_known(i);
+                self.index = index;
             }
             return;
         }
@@ -954,6 +1010,7 @@ impl App {
         }
         self.show_stars |= s.stars;
         self.invert |= s.invert;
+        self.align_on &= !s.no_align;
         if let Some(n) = s.grid_size.filter(|n| GRID_SIZES.contains(n)) {
             self.set_grid_size(n);
         }
@@ -1158,7 +1215,7 @@ impl App {
         }
     }
 
-    /// Stars, Invert, Grid, Known toggles, added right to left.
+    /// Stars, Invert, Align, Grid, Known toggles, added right to left.
     fn view_toggles(&mut self, ui: &mut egui::Ui) {
         if icons::button(ui, Icon::Known, self.known_on, true)
             .on_hover_text("Known asteroids and comets in the field (K)")
@@ -1171,6 +1228,12 @@ impl App {
             .clicked()
         {
             self.set_grid(!self.grid_on);
+        }
+        if icons::button(ui, Icon::Align, self.align_on, true)
+            .on_hover_text("Align frames on the stars, so only moving objects jump (A)")
+            .clicked()
+        {
+            self.align_on = !self.align_on;
         }
         if icons::button(ui, Icon::Invert, self.invert, true)
             .on_hover_text("Invert: dark stars on a white sky (I)")
@@ -1228,7 +1291,12 @@ impl App {
                     ui.spacing_mut().item_spacing.x = S4;
                     let small = |t: String| RichText::new(t).small().color(p.muted);
                     let current = self.current();
-                    if let Some((x, y)) = self.hover {
+                    if let Some((vx, vy)) = self.hover {
+                        // The frame's own pixels, as in the file.
+                        let (x, y) = self
+                            .placement(self.index)
+                            .inverse()
+                            .map_or((vx, vy), |t| t.apply(vx, vy));
                         ui.label(small(format!("x {}  y {}", x.round(), y.round())));
                         let sky = current.and_then(|f| f.wcs.as_ref()).map_or_else(
                             || "No sky coordinates in this image".to_owned(),
@@ -1246,6 +1314,13 @@ impl App {
                             let zoom = (self.view.scale * 100.0).round();
                             ui.label(small(format!("{zoom}%")));
                             ui.label(small(format!("{} stars", thousands(f.stars.len()))));
+                            if self.align_on && f.to_reference.is_none() {
+                                ui.label(
+                                    RichText::new("Not aligned: too few stars match frame 1")
+                                        .small()
+                                        .color(p.danger),
+                                );
+                            }
                             if matches!(self.known, Some(KnownState::Pending(_))) {
                                 ui.label(small("Looking up known objects…".into()));
                                 ui.add(egui::Spinner::new().size(11.0).color(p.muted));
@@ -1411,7 +1486,7 @@ impl App {
     }
 
     fn viewer(&mut self, ui: &mut egui::Ui, rect: Rect, response: &Response) {
-        let Some((w, h)) = self.current().map(|f| (f.width as f32, f.height as f32)) else {
+        let Some((w, h)) = self.view_size() else {
             return;
         };
         if !self.view.fitted && rect.width() > 0.0 && rect.height() > 0.0 {
@@ -1502,7 +1577,10 @@ impl App {
         let origin = rect.min + self.view.offset;
         let image = Rect::from_min_size(origin, vec2(w, h) * scale);
         let painter = ui.painter_at(rect);
-        if image.intersects(rect) {
+        let placement = self.placement(self.index);
+        if image.intersects(rect)
+            && let Some(f) = self.current()
+        {
             painter.add(Shape::Callback(self.gpu.paint(
                 ui.ctx(),
                 rect,
@@ -1510,6 +1588,8 @@ impl App {
                     index: self.index,
                     image,
                     size: [w as usize, h as usize],
+                    texture_size: [f.width, f.height],
+                    map: texture_map(&placement, (w, h), (f.width, f.height)),
                     invert: self.invert,
                 },
             )));
@@ -1521,7 +1601,8 @@ impl App {
             let visible = rect.expand(12.0);
             let stroke = Stroke::new(1.25, theme::STAR);
             for s in &f.stars {
-                let c = origin + vec2(s.x + 0.5, h - 0.5 - s.y) * scale;
+                let (x, y) = placement.apply(f64::from(s.x), f64::from(s.y));
+                let c = origin + vec2(x as f32 + 0.5, h - 0.5 - y as f32) * scale;
                 if visible.contains(c) {
                     painter.circle_stroke(c, (s.fwhm * 1.5 * scale).max(4.0), stroke);
                 }
@@ -1557,7 +1638,7 @@ impl App {
         let mut chips = Vec::new();
         for i in order {
             let Some(o) = k.objects.get(i) else { continue };
-            let Some((x, y)) = o.at.get(self.index).copied().flatten() else {
+            let Some((x, y)) = self.known_at(o, self.index) else {
                 continue;
             };
             let c = origin + vec2(x as f32 + 0.5, h - 0.5 - y as f32) * scale;
@@ -1644,7 +1725,7 @@ impl App {
                         .show(ui, |ui| {
                             ui.spacing_mut().item_spacing.y = 0.0;
                             for (i, o) in k.objects.iter().enumerate() {
-                                let here = o.at.get(self.index).copied().flatten();
+                                let here = self.known_at(o, self.index);
                                 let detail = self.known_detail(&o.object, here);
                                 let selected = self.known_focus == Some(i);
                                 if known_row(ui, &o.object, &detail, selected).clicked() {
@@ -1692,9 +1773,8 @@ impl App {
     fn known_detail(&self, o: &KnownObject, here: Option<(f64, f64)>) -> String {
         let rate = o.motion_ra.hypot(o.motion_dec) / 60.0;
         let mut parts = vec![o.class.clone(), format!("{rate:.2}″/min")];
-        match (here, self.current()) {
-            (Some((x, y)), Some(f)) if self.grid_on => {
-                let (w, h) = (f.width as f32, f.height as f32);
+        match (here, self.view_size()) {
+            (Some((x, y)), Some((w, h))) if self.grid_on => {
                 let u = (x as f32 + 0.5) / w;
                 let v = (h - 0.5 - y as f32) / h;
                 parts.push(format!("box {}", box_label(grid_box(u, v, self.grid_size))));
@@ -2147,6 +2227,31 @@ fn known_row(ui: &mut egui::Ui, o: &KnownObject, detail: &str, selected: bool) -
 
 /// Report box (row, column), 1-based from the top-left, holding the point
 /// at fractions `u` across and `v` down the displayed image.
+/// Texture coordinates of a frame drawn through `placement` (frame pixels →
+/// view pixels) onto a `view`-sized pixel grid, as an affine map of image
+/// coordinates (see [`Draw::map`]). Both use 0–1 with the top-left corner at
+/// the origin; pixels are 0-based FITS pixels with y up.
+fn texture_map(placement: &Affine, view: (f32, f32), texture: (usize, usize)) -> [f32; 6] {
+    let Some(inverse) = placement.inverse() else {
+        return Draw::IDENTITY_MAP;
+    };
+    let (vw, vh) = (f64::from(view.0), f64::from(view.1));
+    let (tw, th) = (texture.0 as f64, texture.1 as f64);
+    let at = |u: f64, v: f64| {
+        let (x, y) = inverse.apply(u * vw - 0.5, (1.0 - v) * vh - 0.5);
+        ((x + 0.5) / tw, 1.0 - (y + 0.5) / th)
+    };
+    let (o, du, dv) = (at(0.0, 0.0), at(1.0, 0.0), at(0.0, 1.0));
+    [
+        (du.0 - o.0) as f32,
+        (dv.0 - o.0) as f32,
+        o.0 as f32,
+        (du.1 - o.1) as f32,
+        (dv.1 - o.1) as f32,
+        o.1 as f32,
+    ]
+}
+
 fn grid_box(u: f32, v: f32, n: usize) -> (usize, usize) {
     let cell = |t: f32| ((t.max(0.0) * n as f32).floor() as usize + 1).min(n);
     (cell(v), cell(u))
@@ -2321,6 +2426,28 @@ mod tests {
         assert_eq!(box_label(grid_box(1.0, 1.0, 4)), "4x4");
         let marks = [grid_box(0.1, 0.3, 4), grid_box(0.3, 0.1, 4)];
         assert_eq!(report_line("XY57_p01", &marks), "XY57_p01: 1x2 2x1");
+    }
+
+    #[test]
+    fn texture_map_follows_the_alignment() {
+        let same = texture_map(&Affine::IDENTITY, (100.0, 50.0), (100, 50));
+        for (a, b) in same.iter().zip(Draw::IDENTITY_MAP) {
+            assert!((a - b).abs() < 1e-6, "{same:?}");
+        }
+        // The telescope drifted: a star at frame pixel (x + 10, y - 4) is at
+        // (x, y) on the first frame.
+        let drift = Affine {
+            m: [1.0, 0.0, -10.0, 0.0, 1.0, 4.0],
+        };
+        let m = texture_map(&drift, (100.0, 50.0), (100, 50));
+        let tex = |u: f32, v: f32| (m[0] * u + m[1] * v + m[2], m[3] * u + m[4] * v + m[5]);
+        // View pixel (20, 30) → frame pixel (30, 26): s = 30.5 / 100,
+        // t = 1 - 26.5 / 50 (texture rows run top down).
+        let (s, t) = tex(20.5 / 100.0, 1.0 - 30.5 / 50.0);
+        assert!(
+            (s - 0.305).abs() < 1e-6 && (t - 0.47).abs() < 1e-6,
+            "{s} {t}"
+        );
     }
 
     #[test]

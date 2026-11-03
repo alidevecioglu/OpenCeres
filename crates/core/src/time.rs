@@ -72,14 +72,24 @@ pub fn parse_iso(value: &str) -> Option<f64> {
     }))
 }
 
+/// Julian date (UTC) of the exposure start: `DATE-OBS`, else `MJD-OBS`.
+///
+/// The FITS standard says both give the same instant, but they don't
+/// always: Pan-STARRS frames from IASC carry `MJD-OBS` in TAI (it equals
+/// the `SHMDOPEN` TAI shutter time, 37.5 s after the UTC `DATE-OBS`) while
+/// declaring `TIMESYS = 'UTC'`. `DATE-OBS` is the value observatories label
+/// and check as UTC, so it wins.
+pub fn start_jd(header: &crate::fits::Header) -> Option<f64> {
+    header
+        .text("DATE-OBS")
+        .and_then(parse_iso)
+        .or_else(|| Some(header.float("MJD-OBS")? + MJD_OFFSET))
+}
+
 /// Julian date (UTC) of the middle of the exposure, which is what MPC
-/// reports need. Uses `MJD-OBS` or `DATE-OBS` (both the exposure *start*,
-/// per the FITS standard) plus half of `EXPTIME`.
+/// reports need: [`start_jd`] plus half of `EXPTIME`.
 pub fn mid_exposure_jd(header: &crate::fits::Header) -> Option<f64> {
-    let start = header
-        .float("MJD-OBS")
-        .map(|mjd| mjd + MJD_OFFSET)
-        .or_else(|| parse_iso(header.text("DATE-OBS")?))?;
+    let start = start_jd(header)?;
     let exposure = header.float("EXPTIME").unwrap_or(0.0);
     Some(start + exposure / 2.0 / 86_400.0)
 }
@@ -142,5 +152,28 @@ mod tests {
         let expected = 4.0 + (10.0 * 3600.0 + 16.0 * 60.0 + 2.332315) / 86_400.0;
         assert_eq!((mid.year, mid.month), (2026, 10));
         assert!((mid.day - expected).abs() * 86_400.0 < 1e-3, "{}", mid.day);
+    }
+
+    /// Pan-STARRS headers as IASC sends them: `MJD-OBS` is TAI and must not
+    /// override the UTC `DATE-OBS`.
+    #[test]
+    fn date_obs_wins_over_a_tai_mjd_obs() {
+        let bytes = crate::fits::tests::make_fits(
+            1,
+            1,
+            &[
+                "DATE-OBS= '2026-10-04T10:15:39.832315'",
+                "TIMESYS = 'UTC     '",
+                "MJD-OBS =     61317.4279783833",
+            ],
+            &[0.0],
+        );
+        let header = crate::fits::parse(&bytes).unwrap().header;
+        let start = start_jd(&header).unwrap();
+        assert!((start - parse_iso("2026-10-04T10:15:39.832315").unwrap()).abs() * 86_400.0 < 1e-3);
+        // Without DATE-OBS, MJD-OBS is all there is.
+        let bytes = crate::fits::tests::make_fits(1, 1, &["MJD-OBS =     61317.5"], &[0.0]);
+        let header = crate::fits::parse(&bytes).unwrap().header;
+        assert_eq!(start_jd(&header), Some(61317.5 + MJD_OFFSET));
     }
 }

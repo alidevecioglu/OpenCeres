@@ -1,8 +1,10 @@
 //! World coordinate system: gnomonic (TAN) projection between pixels and the
 //! sky, as described by the standard FITS WCS header keywords.
 //!
-//! Distortion terms (SIP, TPV) are not applied yet; they are small near the
-//! reference pixel and our own plate solution will replace them.
+//! Distortion terms (SIP, TPV, and the non-standard `PCAiXmYn` polynomial
+//! Pan-STARRS frames carry) are not applied. On IASC's Pan-STARRS chips
+//! that leaves errors of 1.5–6″ against Gaia DR3, growing across the chip,
+//! so positions for reports must come from our own plate solution.
 
 use crate::fits::Header;
 

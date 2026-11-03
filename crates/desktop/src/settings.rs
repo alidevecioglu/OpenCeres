@@ -233,7 +233,32 @@ pub static ENTRIES: &[Entry] = &[
             set: |p, v| p.invert = v,
         },
     },
+    Entry {
+        id: "align",
+        category: Category::Viewing,
+        label: "Align frames on the stars",
+        description: "Matches the stars of every frame to the first, so they stand still \
+                      in the blink even when the telescope drifted between exposures and \
+                      only moving objects jump. A switches it for now.",
+        keywords: "align register match stars guiding drift shift stack blink steady \
+                   wobble jump",
+        kind: Kind::Toggle {
+            get: |p| p.align,
+            set: |p, v| p.align = v,
+        },
+    },
     // Report grid
+    Entry {
+        id: "show_grid",
+        category: Category::ReportGrid,
+        label: "Show the grid",
+        description: "Draw the report grid when a set opens. G switches it for now.",
+        keywords: "boxes cells show on open default report",
+        kind: Kind::Toggle {
+            get: |p| p.show_grid,
+            set: |p, v| p.show_grid = v,
+        },
+    },
     Entry {
         id: "grid_size",
         category: Category::ReportGrid,
@@ -258,6 +283,18 @@ pub static ENTRIES: &[Entry] = &[
         kind: Kind::Custom(settings_ui::grid_names),
     },
     // Known objects
+    Entry {
+        id: "show_known",
+        category: Category::Known,
+        label: "Show known objects",
+        description: "Look up and mark known asteroids and comets when a set opens. \
+                      K switches it for now.",
+        keywords: "skybot lookup default on open asteroids comets mark",
+        kind: Kind::Toggle {
+            get: |p| p.show_known,
+            set: |p, v| p.show_known = v,
+        },
+    },
     Entry {
         id: "known_source",
         category: Category::Known,

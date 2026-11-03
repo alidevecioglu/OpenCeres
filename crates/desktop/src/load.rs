@@ -4,6 +4,7 @@
 
 use std::path::Path;
 
+use openceres_core::align::{self, Affine};
 use openceres_core::{detect, fits, known, render, time, wcs::Wcs};
 
 use crate::zip;
@@ -41,6 +42,10 @@ pub struct Frame {
     /// MPC observatory code, if the telescope is recognised.
     pub observatory: Option<&'static str>,
     pub filter: Option<String>,
+    /// Maps this frame's pixels onto the first frame's, found by matching
+    /// stars (the identity for the first frame). `None` if too few stars
+    /// matched; the frame is then shown as it is.
+    pub to_reference: Option<Affine>,
     name: String,
 }
 
@@ -160,9 +165,7 @@ fn load(source: Source) -> Result<Frame, String> {
     let h = &image.header;
     let date_obs = h.text("DATE-OBS").map(str::to_owned);
     let mjd_obs = h.float("MJD-OBS");
-    let jd = mjd_obs
-        .map(|m| m + time::MJD_OFFSET)
-        .or_else(|| date_obs.as_deref().and_then(time::parse_iso));
+    let jd = time::start_jd(h);
 
     Ok(Frame {
         width: image.width,
@@ -176,6 +179,7 @@ fn load(source: Source) -> Result<Frame, String> {
         mid_jd: time::mid_exposure_jd(h),
         observatory: known::observatory_code(h),
         filter: h.text("FILTER").map(str::to_owned),
+        to_reference: None,
         name,
     })
 }
@@ -214,7 +218,34 @@ pub fn open(paths: &[String]) -> Result<ImageSet, String> {
     } else {
         frames.sort_by(|a, b| a.name.cmp(&b.name));
     }
+    align_frames(&mut frames);
     Ok(ImageSet { name, frames })
+}
+
+/// Matches every frame's stars against the first frame's (in parallel; a
+/// few tens of milliseconds each), so the blink can hold the stars still.
+fn align_frames(frames: &mut [Frame]) {
+    let positions = |f: &Frame| -> Vec<(f64, f64)> {
+        f.stars
+            .iter()
+            .map(|s| (f64::from(s.x), f64::from(s.y)))
+            .collect()
+    };
+    let Some((first, rest)) = frames.split_first_mut() else {
+        return;
+    };
+    first.to_reference = Some(Affine::IDENTITY);
+    let reference = positions(first);
+    std::thread::scope(|s| {
+        for frame in rest {
+            let reference = &reference;
+            s.spawn(move || {
+                frame.to_reference = align::align(reference, &positions(frame))
+                    .map(|a| a.transform)
+                    .filter(|t| t.inverse().is_some());
+            });
+        }
+    });
 }
 
 /// Loading needs several hundred MB of temporary images. The allocator keeps

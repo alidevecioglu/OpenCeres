@@ -1,8 +1,10 @@
 //! Drawing frames with OpenGL: each frame is one single-channel texture
 //! (1 byte per pixel) shown by a tiny shader that also inverts and, when
 //! zoomed out, averages the texels under each screen pixel so faint detail
-//! is not skipped. All GL calls happen inside egui's paint callback, where
-//! the context is current.
+//! is not skipped. Frames aligned on their stars are drawn through an affine
+//! map from the view to the texture, so nothing is resampled on the CPU and
+//! no extra copy of the pixels is kept. All GL calls happen inside egui's
+//! paint callback, where the context is current.
 
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -24,6 +26,8 @@ struct Program {
     vbo: glow::Buffer,
     vao: Option<glow::VertexArray>,
     u_rect: Option<glow::UniformLocation>,
+    u_map_x: Option<glow::UniformLocation>,
+    u_map_y: Option<glow::UniformLocation>,
     u_invert: Option<glow::UniformLocation>,
     u_foot: Option<glow::UniformLocation>,
     u_taps: Option<glow::UniformLocation>,
@@ -51,7 +55,17 @@ pub struct Draw {
     pub image: Rect,
     /// Image size in pixels.
     pub size: [usize; 2],
+    /// The frame's own size in pixels (differs from `size` only when it is
+    /// drawn onto another frame's pixel grid).
+    pub texture_size: [usize; 2],
+    /// Texture coordinates from image coordinates (both 0–1, top-left
+    /// origin): `s = m[0] u + m[1] v + m[2]`, `t = m[3] u + m[4] v + m[5]`.
+    pub map: [f32; 6],
     pub invert: bool,
+}
+
+impl Draw {
+    pub const IDENTITY_MAP: [f32; 6] = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0];
 }
 
 #[derive(Clone, Default)]
@@ -174,12 +188,15 @@ impl State {
                 ndc_x(d.image.max.x),
                 ndc_y(d.image.max.y),
             );
+            let m = d.map;
+            gl.uniform_3_f32(p.u_map_x.as_ref(), m[0], m[1], m[2]);
+            gl.uniform_3_f32(p.u_map_y.as_ref(), m[3], m[4], m[5]);
             gl.uniform_1_f32(p.u_invert.as_ref(), if d.invert { 1.0 } else { 0.0 });
             gl.uniform_1_f32(p.u_taps.as_ref(), taps);
             gl.uniform_2_f32(
                 p.u_foot.as_ref(),
-                foot / d.size[0] as f32,
-                foot / d.size[1] as f32,
+                foot / d.texture_size[0] as f32,
+                foot / d.texture_size[1] as f32,
             );
             gl.uniform_1_i32(p.u_tex.as_ref(), 0);
             gl.active_texture(glow::TEXTURE0);
@@ -292,11 +309,15 @@ impl Program {
         let fragment = format!(
             "{header}{fin} vec2 v_uv;\n{out_decl}uniform sampler2D u_tex;\n\
              uniform float u_invert;\nuniform float u_taps;\nuniform vec2 u_foot;\n\
-             void main() {{\n  float sum = 0.0;\n  \
+             uniform vec3 u_map_x;\nuniform vec3 u_map_y;\n\
+             void main() {{\n  vec3 p = vec3(v_uv, 1.0);\n  \
+             vec2 uv = vec2(dot(u_map_x, p), dot(u_map_y, p));\n  \
+             if (uv.x < 0.0 || uv.y < 0.0 || uv.x > 1.0 || uv.y > 1.0) discard;\n  \
+             float sum = 0.0;\n  \
              for (int i = 0; i < 4; i++) {{\n    if (float(i) >= u_taps) break;\n    \
              for (int j = 0; j < 4; j++) {{\n      if (float(j) >= u_taps) break;\n      \
              vec2 off = (vec2(float(i), float(j)) + 0.5) / u_taps - 0.5;\n      \
-             sum += {sample}(u_tex, v_uv + off * u_foot).r;\n    }}\n  }}\n  \
+             sum += {sample}(u_tex, uv + off * u_foot).r;\n    }}\n  }}\n  \
              float g = sum / (u_taps * u_taps);\n  g = mix(g, 1.0 - g, u_invert);\n  \
              {out} = vec4(g, g, g, 1.0);\n}}\n"
         );
@@ -358,6 +379,8 @@ impl Program {
             };
             Ok(Program {
                 u_rect: gl.get_uniform_location(program, "u_rect"),
+                u_map_x: gl.get_uniform_location(program, "u_map_x"),
+                u_map_y: gl.get_uniform_location(program, "u_map_y"),
                 u_invert: gl.get_uniform_location(program, "u_invert"),
                 u_foot: gl.get_uniform_location(program, "u_foot"),
                 u_taps: gl.get_uniform_location(program, "u_taps"),

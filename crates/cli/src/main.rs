@@ -5,7 +5,7 @@ use std::process::ExitCode;
 
 use openceres_core::detect::{self, DetectOptions};
 use openceres_core::fits::{self, Image, Value};
-use openceres_core::{known, time, wcs::Wcs};
+use openceres_core::{align, known, time, wcs::Wcs};
 
 const USAGE: &str = "\
 Usage:
@@ -15,6 +15,8 @@ Usage:
                                            known asteroids/comets in the field, with the nearest
                                            detection: from SkyBoT (needs internet and curl), or
                                            offline from an uncompressed MPCORB.DAT (`-` = stdin)
+  openceres align <image.fits>...          how each frame maps onto the first by matching stars,
+                                           compared with what the frames' WCS headers say
 
 Options for `stars`:
   --sigma <n>    detection threshold in noise sigmas (default 5)
@@ -25,6 +27,7 @@ fn main() -> ExitCode {
     let result = match args.first().map(String::as_str) {
         Some("info") if args.len() > 1 => info(&args[1..]),
         Some("stars") if args.len() > 1 => stars(&args[1..]),
+        Some("align") if args.len() > 2 => align(&args[1..]),
         Some("known") if args.len() == 2 => known_objects(&args[1], None),
         Some("known") if args.len() == 4 && args[2] == "--mpcorb" => {
             known_objects(&args[1], Some(&args[3]))
@@ -233,4 +236,55 @@ fn show(v: &Value) -> String {
         Value::Float(f) => f.to_string(),
         Value::Text(s) => s.clone(),
     }
+}
+
+fn align(paths: &[String]) -> Result<()> {
+    let frames = paths
+        .iter()
+        .map(|p| {
+            let image = load(p)?;
+            let stars: Vec<(f64, f64)> = detect::detect(&image, &DetectOptions::default())
+                .iter()
+                .map(|s| (s.x, s.y))
+                .collect();
+            Ok((image, stars))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let (ref_image, ref_stars) = &frames[0];
+    let ref_wcs = Wcs::from_header(&ref_image.header);
+    let (cx, cy) = (ref_image.width as f64 / 2.0, ref_image.height as f64 / 2.0);
+    println!("reference {}: {} stars", paths[0], ref_stars.len());
+    for (path, (image, stars)) in paths.iter().zip(&frames).skip(1) {
+        let start = std::time::Instant::now();
+        let found = align::align(ref_stars, stars);
+        let ms = start.elapsed().as_secs_f64() * 1e3;
+        println!("{path}: {} stars, matched in {ms:.0} ms", stars.len());
+        let Some(a) = found else {
+            println!("  no alignment found");
+            continue;
+        };
+        let to_target = a.transform.inverse().ok_or("singular transform")?;
+        let (tx, ty) = to_target.apply(cx, cy);
+        println!(
+            "  centre moved by ({:+.3}, {:+.3}) px, rotation {:+.4}°, scale {:.5}, {} stars, rms {:.3} px",
+            tx - cx,
+            ty - cy,
+            -a.transform.rotation(),
+            1.0 / a.transform.scale(),
+            a.matched,
+            a.rms
+        );
+        if let (Some(rw), Some(tw)) = (&ref_wcs, Wcs::from_header(&image.header)) {
+            let (ra, dec) = rw.pixel_to_sky(cx, cy);
+            if let Some((wx, wy)) = tw.sky_to_pixel(ra, dec) {
+                println!(
+                    "  WCS headers say ({:+.3}, {:+.3}) px; stars and WCS differ by {:.3} px",
+                    wx - cx,
+                    wy - cy,
+                    (wx - tx).hypot(wy - ty)
+                );
+            }
+        }
+    }
+    Ok(())
 }

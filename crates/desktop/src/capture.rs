@@ -11,7 +11,7 @@
 //! (and never saves them), opens the paths given on the command line, waits
 //! until they have loaded and a few frames have been drawn, saves a PNG of
 //! its own window and exits. `OPENCERES_SCREENSHOT_STATE` is a comma list of:
-//! `light`, `dark`, `stars`, `invert`, `grid`, `panel`, `settings` (or
+//! `light`, `dark`, `stars`, `invert`, `noalign` (frames as stored), `grid`, `panel`, `settings` (or
 //! `settings=PAGE`, e.g. `settings=updates`), `search=TEXT` (in Settings),
 //! `update=VERSION` (pretend that version is available), `help`, `history`
 //! or `history=SET` (the history window, with SET's search opened;
@@ -19,7 +19,7 @@
 //! them a folder), `paused`, `frame=N`
 //! (1-based), `mark=RxC` (row × column, repeatable), `gridsize=N`, `known`
 //! (look up known objects and wait for the answer), `focus=LABEL` (centre
-//! and zoom on that known object) and `size=WxH` (window size in points).
+//! and zoom on that known object, where it is on the first frame) and `size=WxH` (window size in points).
 
 use eframe::egui;
 
@@ -28,6 +28,7 @@ pub struct State {
     pub theme: Option<egui::Theme>,
     pub stars: bool,
     pub invert: bool,
+    pub no_align: bool,
     pub grid: bool,
     pub panel: bool,
     pub settings: bool,
@@ -91,6 +92,7 @@ impl State {
                 "dark" => s.theme = Some(egui::Theme::Dark),
                 "stars" => s.stars = true,
                 "invert" => s.invert = true,
+                "noalign" => s.no_align = true,
                 "grid" => s.grid = true,
                 "panel" => s.panel = true,
                 "settings" => {

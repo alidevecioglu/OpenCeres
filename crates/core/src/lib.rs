@@ -5,6 +5,7 @@
 //! stored in the file. FITS uses 1-based coordinates, so FITS (1, 1) is our
 //! (0, 0); the conversion happens only inside [`wcs`].
 
+pub mod align;
 pub mod detect;
 pub mod ephem;
 pub mod fits;

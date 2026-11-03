@@ -18,6 +18,7 @@ pub enum Icon {
     Plus,
     Stars,
     Invert,
+    Align,
     Grid,
     Known,
     Sidebar,
@@ -85,6 +86,14 @@ pub fn paint(painter: &egui::Painter, rect: Rect, icon: Icon, color: Color32) {
                 .collect();
             painter.add(Shape::convex_polygon(half, color, Stroke::NONE));
             painter.circle_stroke(c, r, stroke);
+        }
+        Icon::Align => {
+            // A faint ring sliding onto a solid one: a star brought into line.
+            let off = at(-3.0, -3.0);
+            painter.circle_stroke(off, 3.75 * s, Stroke::new(1.25, color.gamma_multiply(0.45)));
+            let c = at(1.5, 1.5);
+            painter.circle_stroke(c, 3.75 * s, stroke);
+            painter.circle_filled(c, 1.25 * s, color);
         }
         Icon::Grid => {
             let r = Rect::from_center_size(c, vec2(12.0, 12.0) * s);

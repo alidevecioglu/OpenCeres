@@ -53,7 +53,8 @@ objects, measure positions, write MPC reports. Product priorities, in order:
 ## Layout
 
 - `crates/core/src/` — `fits` (reader), `detect` (background, sources,
-  windowed centroids), `wcs` (TAN projection), `time` (JD ↔ calendar),
+  windowed centroids), `align` (star matching between frames for the
+  blink), `wcs` (TAN projection), `time` (JD ↔ calendar),
   `mpc` (80-column format), `render` (display stretch).
 - `crates/cli/` — `openceres info|stars` for checking the core on real files.
 - `crates/desktop/src/history.rs` — search history: one JSON file per search
