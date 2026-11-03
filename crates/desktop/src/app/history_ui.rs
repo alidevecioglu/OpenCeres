@@ -50,7 +50,7 @@ enum Action {
 
 impl App {
     pub(super) fn modal_open(&self) -> bool {
-        self.settings_open || self.searches.window_open
+        self.settings_open || self.searches.window_open || self.team.window_open
     }
 
     pub(super) fn toggle_history(&mut self) {
@@ -61,6 +61,7 @@ impl App {
             h.note = None;
             h.confirm_delete = None;
             self.settings_open = false;
+            self.team.window_open = false;
             self.help_open = false;
         }
     }

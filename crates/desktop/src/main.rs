@@ -16,6 +16,7 @@ mod load;
 mod png;
 mod prefs;
 mod settings;
+mod team;
 mod theme;
 mod update;
 mod zip;

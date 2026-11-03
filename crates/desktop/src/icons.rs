@@ -24,6 +24,7 @@ pub enum Icon {
     Sidebar,
     Gear,
     History,
+    Team,
     Close,
     Check,
     // Settings categories and search.
@@ -231,6 +232,26 @@ pub fn paint(painter: &egui::Painter, rect: Rect, icon: Icon, color: Color32) {
                 vec![at(0.0, -3.75), at(0.0, 0.0), at(2.75, 1.75)],
                 Stroke::new(1.5, color),
             );
+        }
+        Icon::Team => {
+            // Two people, the one behind slightly smaller.
+            painter.circle_stroke(at(3.0, -3.25), 2.0 * s, Stroke::new(1.25, color));
+            painter.add(Shape::line(
+                vec![at(5.0, 1.0), at(6.5, 2.0), at(7.0, 4.5)],
+                Stroke::new(1.25, color),
+            ));
+            painter.circle_stroke(at(-1.5, -2.5), 2.75 * s, stroke);
+            painter.add(Shape::line(
+                vec![
+                    at(-7.0, 6.0),
+                    at(-6.25, 2.75),
+                    at(-4.0, 1.25),
+                    at(1.0, 1.25),
+                    at(3.25, 2.75),
+                    at(4.0, 6.0),
+                ],
+                stroke,
+            ));
         }
         Icon::Check => {
             painter.line(

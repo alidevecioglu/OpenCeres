@@ -4,6 +4,7 @@
 pub(crate) mod history_ui;
 mod objects_ui;
 pub(crate) mod settings_ui;
+pub(crate) mod team_ui;
 
 use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, TryRecvError};
@@ -197,6 +198,8 @@ pub struct App {
     mpcorb_auto_done: bool,
     updates: Updates,
     searches: Searches,
+    /// The optional team server (see [`crate::team`]).
+    team: team_ui::Team,
     /// What Settings shows about the offline catalogue; `None` = read again.
     catalogue: Option<Catalogue>,
     loading: Option<Loading>,
@@ -275,6 +278,7 @@ impl App {
             enabled: capture.is_none() || std::env::var_os("OPENCERES_HISTORY_DIR").is_some(),
             ..Searches::default()
         };
+        let team = team_ui::Team::new(&cc.egui_ctx, capture.is_none());
         let mut app = App {
             prefs,
             saved: prefs,
@@ -311,6 +315,7 @@ impl App {
             mpcorb_auto_done: false,
             updates: Updates::default(),
             searches,
+            team,
             catalogue: None,
             loading: None,
             error: None,
@@ -323,6 +328,7 @@ impl App {
             help_open: false,
             capture,
         };
+        app.team_start();
         if !paths.is_empty() {
             app.open(&cc.egui_ctx, paths);
         }
@@ -436,6 +442,7 @@ impl App {
                 self.view = View::default();
                 self.hover = None;
                 self.start_search();
+                self.team_set_opened();
             }
             Err(e) => {
                 self.searches.resume_id = None;
@@ -720,6 +727,7 @@ impl App {
     fn open_settings(&mut self, page: Category) {
         self.settings_open = true;
         self.searches.window_open = false;
+        self.team.window_open = false;
         self.settings_page = page;
         self.settings_search.clear();
         self.help_open = false;
@@ -887,6 +895,7 @@ impl App {
                             Key::Comma => {
                                 self.settings_open = !self.settings_open;
                                 self.searches.window_open = false;
+                                self.team.window_open = false;
                                 self.help_open = false;
                             }
                             _ => continue,
@@ -898,6 +907,7 @@ impl App {
                         self.help_open = false;
                         self.settings_open = false;
                         self.searches.window_open = false;
+                        self.team.window_open = false;
                         handled = true;
                     } else if key == Key::Escape && self.marking.is_some() {
                         self.finish_marking();
@@ -1161,12 +1171,29 @@ impl App {
                         if history.clicked() {
                             self.toggle_history();
                         }
+                        if self.team.configured() {
+                            let team = icons::button(ui, Icon::Team, self.team.window_open, true)
+                                .on_hover_text("Team: assignments and announcements");
+                            if team.clicked() {
+                                self.toggle_team();
+                            }
+                        }
                         if let Some(r) = &self.updates.found {
                             ui.add_space(S1);
                             let pill = update_pill(ui, &format!("Update {}", r.version))
                                 .on_hover_text("A new version of OpenCeres is available");
                             if pill.clicked() {
                                 self.open_settings(Category::Updates);
+                            }
+                        }
+                        if let Some(m) = self.team.matched.as_ref().filter(|_| self.set.is_some()) {
+                            ui.add_space(S1);
+                            let pill = update_pill(ui, &m.badge()).on_hover_text(
+                                "This set is part of your team's campaign. Submit your \
+                                 review in the side panel.",
+                            );
+                            if pill.clicked() {
+                                self.prefs.panel_open = true;
                             }
                         }
                         if self.set.is_some() {
@@ -1429,6 +1456,12 @@ impl App {
         let count = (!self.objects.is_empty()).then_some(self.objects.len());
         section_heading(ui, "Objects", count);
         self.objects_section(ui, frame);
+        if self.team_has_section() {
+            ui.add_space(S3);
+            hline(ui, p.border);
+            ui.add_space(S2);
+            self.team_section(ui);
+        }
         if self.set.is_some() && self.searches.record.is_some() {
             ui.add_space(S3);
             hline(ui, p.border);
@@ -2166,6 +2199,7 @@ impl eframe::App for App {
         self.poll_known();
         self.ensure_known(&ctx);
         self.poll_export();
+        self.poll_team();
         self.drive_capture(&ctx);
         if let Some(e) = self.gpu.take_error() {
             self.error = Some(e);
@@ -2190,6 +2224,7 @@ impl eframe::App for App {
         egui::CentralPanel::no_frame().show(ui, |ui| self.stage(ui, frame));
         self.settings_window(&ctx, now);
         self.history_window(&ctx, frame);
+        self.team_window(&ctx);
         self.autosave();
 
         if self.prefs != self.saved {

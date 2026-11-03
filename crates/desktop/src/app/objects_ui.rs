@@ -691,12 +691,19 @@ impl App {
 
     /// Writes the open search with its objects to `path`; with cutouts,
     /// in the background (the images are read again).
-    pub(super) fn write_report(&mut self, ctx: &egui::Context, path: PathBuf, cutouts: bool) {
-        let Some(mut record) = self.searches.record.clone() else {
-            return;
-        };
+    /// The open search with its marked boxes and objects: what export and
+    /// "Submit review" send.
+    pub(super) fn report_record(&self) -> Option<Record> {
+        let mut record = self.searches.record.clone()?;
         record.objects.clone_from(&self.objects);
         record.boxes.clone_from(&self.marks);
+        Some(record)
+    }
+
+    pub(super) fn write_report(&mut self, ctx: &egui::Context, path: PathBuf, cutouts: bool) {
+        let Some(record) = self.report_record() else {
+            return;
+        };
         self.report_error = None;
         self.report_note = None;
         if !cutouts {

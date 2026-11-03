@@ -10,7 +10,7 @@
 
 use eframe::egui;
 
-use crate::app::{App, history_ui, settings_ui};
+use crate::app::{App, history_ui, settings_ui, team_ui};
 use crate::icons::Icon;
 use crate::prefs::{GRID_SIZES, KnownSource, Prefs, SPEEDS, ThemeChoice};
 
@@ -23,19 +23,21 @@ pub enum Category {
     ReportGrid,
     Known,
     History,
+    Team,
     Updates,
     Shortcuts,
     About,
 }
 
 impl Category {
-    pub const ALL: [Category; 9] = [
+    pub const ALL: [Category; 10] = [
         Category::General,
         Category::Appearance,
         Category::Viewing,
         Category::ReportGrid,
         Category::Known,
         Category::History,
+        Category::Team,
         Category::Updates,
         Category::Shortcuts,
         Category::About,
@@ -49,6 +51,7 @@ impl Category {
             Category::ReportGrid => "Report grid",
             Category::Known => "Known objects",
             Category::History => "History",
+            Category::Team => "Team",
             Category::Updates => "Updates",
             Category::Shortcuts => "Shortcuts",
             Category::About => "About",
@@ -63,6 +66,7 @@ impl Category {
             Category::ReportGrid => Icon::Grid,
             Category::Known => Icon::Known,
             Category::History => Icon::History,
+            Category::Team => Icon::Team,
             Category::Updates => Icon::Update,
             Category::Shortcuts => Icon::Keyboard,
             Category::About => Icon::Info,
@@ -346,6 +350,28 @@ pub static ENTRIES: &[Entry] = &[
                       import a class's searches. H opens it from the main window.",
         keywords: "history searches export import csv json teacher finds reported",
         kind: Kind::Custom(history_ui::open_history),
+    },
+    // Team
+    Entry {
+        id: "team_server",
+        category: Category::Team,
+        label: "Team server",
+        description: "An OpenCeres Team server, if your teacher or club uses one: \
+                      campaigns, assigned sets and everyone's findings. Leave it empty \
+                      to keep OpenCeres fully offline.",
+        keywords: "server cloud self-hosted url address backend campaign class teacher \
+                   online offline connection test",
+        kind: Kind::Custom(team_ui::server_setting),
+    },
+    Entry {
+        id: "team_account",
+        category: Category::Team,
+        label: "Account",
+        description: "Sign in with the account you have on the team server. Only the \
+                      server address and the session are kept, on this computer.",
+        keywords: "sign in log in login sign out logout email password account user \
+                   change password",
+        kind: Kind::Custom(team_ui::account_setting),
     },
     // Updates
     Entry {
