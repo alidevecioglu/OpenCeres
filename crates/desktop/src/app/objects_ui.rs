@@ -296,16 +296,15 @@ impl App {
                     .enumerate()
                     .filter_map(|(i, p)| Some((i, to_screen(i, (*p)?))))
                     .collect();
-            let line: Vec<Pos2> = points.iter().map(|p| p.1).collect();
-            if line.len() > 1 {
-                painter.add(egui::Shape::line(
-                    line.clone(),
-                    Stroke::new(1.0, color.gamma_multiply(0.6)),
-                ));
+            let r = (3.0 * scale).max(9.0);
+            for pair in points.windows(2) {
+                if let Some(segment) = between_rings(pair[0].1, pair[1].1, r) {
+                    painter.line_segment(segment, Stroke::new(1.0, color.gamma_multiply(0.6)));
+                }
             }
             for &(i, c) in &points {
                 if i != self.index {
-                    painter.circle_filled(c, 2.25, color.gamma_multiply(0.8));
+                    painter.circle_stroke(c, r, Stroke::new(1.0, color.gamma_multiply(0.8)));
                 }
             }
             let Some(&(_, c)) = points.iter().find(|p| p.0 == self.index) else {
@@ -314,7 +313,6 @@ impl App {
             if !rect.expand(40.0).contains(c) {
                 return;
             }
-            let r = (3.0 * scale).max(9.0);
             let width = if active { 2.25 } else { 1.75 };
             painter.circle_stroke(c, r, Stroke::new(width + 2.0, theme::KNOWN_HALO));
             painter.circle_stroke(c, r, Stroke::new(width, color));
@@ -886,6 +884,19 @@ fn cutout_requests(
 
 /// `Saved XY57_p01 Ayşe.json (shown in Finder)`: the folder is long and the
 /// file is revealed anyway.
+/// The part of the track from `a` to `b` outside the rings of radius `r`
+/// around them, so the line never covers the object inside a ring. `None`
+/// when the rings touch and no line is left to draw.
+fn between_rings(a: Pos2, b: Pos2, r: f32) -> Option<[Pos2; 2]> {
+    let delta = b - a;
+    let length = delta.length();
+    if length <= 2.0 * r {
+        return None;
+    }
+    let inset = delta / length * r;
+    Some([a + inset, b - inset])
+}
+
 fn saved_note(path: &std::path::Path) -> String {
     let name = path.file_name().map_or_else(
         || path.display().to_string(),
@@ -931,5 +942,15 @@ mod tests {
         assert!((pa - 90.0).abs() < 1e-6);
         let (_, pa) = separation_and_angle(20.0, 4.0, 20.0 - s, 4.0 - s);
         assert!((pa - 225.0).abs() < 0.1, "{pa}");
+    }
+
+    #[test]
+    fn track_stops_at_the_rings() {
+        let [from, to] = between_rings(pos2(0.0, 0.0), pos2(30.0, 40.0), 10.0).unwrap();
+        assert!((from - pos2(6.0, 8.0)).length() < 1e-4, "{from:?}");
+        assert!((to - pos2(24.0, 32.0)).length() < 1e-4, "{to:?}");
+        // Rings that touch or overlap leave nothing to draw.
+        assert!(between_rings(pos2(0.0, 0.0), pos2(20.0, 0.0), 10.0).is_none());
+        assert!(between_rings(pos2(5.0, 5.0), pos2(5.0, 5.0), 10.0).is_none());
     }
 }
