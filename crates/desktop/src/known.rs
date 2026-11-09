@@ -381,13 +381,6 @@ pub fn start_check(ctx: &egui::Context) -> Receiver<Result<Freshness, String>> {
     rx
 }
 
-/// Seconds since the local catalogue's version was published (or
-/// downloaded), if there is one.
-pub fn catalogue_age() -> Option<u64> {
-    let v = local_version(&catalogue_path()?)?;
-    Some(crate::format::unix_now().saturating_sub(v.modified?))
-}
-
 /// How a download ended.
 pub enum Fetched {
     Downloaded,

@@ -378,8 +378,8 @@ pub static ENTRIES: &[Entry] = &[
         id: "update_check",
         category: Category::Updates,
         label: "Check for updates automatically",
-        description: "Once a day at most, asks GitHub whether a newer OpenCeres is out. \
-                      Nothing is downloaded without asking.",
+        description: "Each time OpenCeres starts, asks GitHub whether a newer version is \
+                      out. Nothing is downloaded without asking.",
         keywords: "update new version release github automatic",
         kind: Kind::Toggle {
             get: |p| p.update_check,

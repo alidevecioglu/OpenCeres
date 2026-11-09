@@ -3,6 +3,7 @@
 
 pub(crate) mod history_ui;
 mod objects_ui;
+mod offers_ui;
 pub(crate) mod settings_ui;
 pub(crate) mod team_ui;
 
@@ -27,6 +28,7 @@ use crate::prefs::{GRID_SIZES, KnownSource, Prefs, SPEEDS, ThemeChoice};
 use crate::settings::Category;
 use crate::theme::{self, S1, S2, S3, S4, S5, palette};
 use crate::update;
+use offers_ui::Offer;
 use openceres_core::align::Affine;
 use openceres_core::known::KnownObject;
 
@@ -40,8 +42,6 @@ const SWITCH_EARLY: f64 = 0.03;
 const CAPTURE_SETTLE: u32 = 2;
 const CAPTURE_SHOOT: u32 = 6;
 const CAPTURE_WAIT: f64 = 0.6;
-/// Seconds between automatic update and catalogue checks.
-const DAY: u64 = 86_400;
 
 struct Set {
     name: String,
@@ -196,6 +196,8 @@ pub struct App {
     /// The background check found a newer catalogue (hint in the panel).
     mpcorb_newer: bool,
     mpcorb_auto_done: bool,
+    /// What the startup checks found and the user was asked about.
+    offers: offers_ui::Offers,
     updates: Updates,
     searches: Searches,
     /// The optional team server (see [`crate::team`]).
@@ -313,6 +315,7 @@ impl App {
             mpcorb_fresh: None,
             mpcorb_newer: false,
             mpcorb_auto_done: false,
+            offers: offers_ui::Offers::default(),
             updates: Updates::default(),
             searches,
             team,
@@ -562,7 +565,6 @@ impl App {
                 self.download_error = None;
                 self.mpcorb_newer = false;
                 self.mpcorb_fresh = None;
-                self.prefs.mpcorb_last_check = format::unix_now();
                 if let Fetched::AlreadyCurrent = fetched {
                     self.download_note =
                         Some("Already up to date — nothing was downloaded.".into());
@@ -597,13 +599,13 @@ impl App {
         };
         self.mpcorb_check = None;
         match &result {
-            // Remembered only when current, so a newer catalogue is
-            // pointed out again on the next start.
-            Ok(Freshness::Current(_)) => {
-                self.prefs.mpcorb_last_check = format::unix_now();
-                self.mpcorb_newer = false;
+            Ok(Freshness::Current(_)) => self.mpcorb_newer = false,
+            Ok(Freshness::Newer(_)) => {
+                self.mpcorb_newer = true;
+                if !manual && self.download.is_none() {
+                    self.offers.catalogue = Offer::Asking;
+                }
             }
-            Ok(Freshness::Newer(_)) => self.mpcorb_newer = true,
             Err(_) => {}
         }
         if manual {
@@ -611,25 +613,21 @@ impl App {
         }
     }
 
-    /// Once per session: the app update check (at most daily), and, with
-    /// the offline source, a catalogue check when it is over a day old.
-    /// Never retried in a loop, never downloads by itself.
+    /// Once per session, at start: the app update check and, with the
+    /// offline source and a catalogue on this computer, a catalogue check.
+    /// What they find is offered in [`offers_ui`]; nothing is downloaded
+    /// without asking and a failed check stays silent.
     fn auto_checks(&mut self, ctx: &egui::Context) {
         if self.capture.is_some() {
             return;
         }
-        let now = format::unix_now();
         if !self.updates.auto_done && self.prefs.update_check {
             self.updates.auto_done = true;
-            if now.saturating_sub(self.prefs.update_last_check) >= DAY {
-                self.start_update_check(ctx, false);
-            }
+            self.start_update_check(ctx, false);
         }
         if !self.mpcorb_auto_done && self.prefs.known_source == KnownSource::Mpcorb {
             self.mpcorb_auto_done = true;
-            if now.saturating_sub(self.prefs.mpcorb_last_check) >= DAY
-                && known::catalogue_age().is_some_and(|age| age >= DAY)
-            {
+            if known::catalogue_path().is_some_and(|path| path.is_file()) {
                 self.start_mpcorb_check(ctx, false);
             }
         }
@@ -673,6 +671,9 @@ impl App {
                         self.prefs.update_last_check = now;
                     }
                     Ok(update::Check::Available(release)) => {
+                        if !u.manual {
+                            self.offers.app = Offer::Asking;
+                        }
                         u.found = Some(release);
                         u.error = None;
                         u.checked_at = Some(format::unix_now());
@@ -1126,6 +1127,10 @@ impl App {
                 }),
                 version,
             });
+        }
+        if s.offers {
+            self.offers.app = Offer::Asking;
+            self.offers.catalogue = Offer::Asking;
         }
         self.help_open = s.help;
     }
@@ -2221,7 +2226,11 @@ impl eframe::App for App {
         self.error_banner(ui);
         self.status_bar(ui);
         self.side_panel(ui, frame);
-        egui::CentralPanel::no_frame().show(ui, |ui| self.stage(ui, frame));
+        let stage = egui::CentralPanel::no_frame()
+            .show(ui, |ui| self.stage(ui, frame))
+            .response
+            .rect;
+        self.offers_box(&ctx, stage);
         self.settings_window(&ctx, now);
         self.history_window(&ctx, frame);
         self.team_window(&ctx);

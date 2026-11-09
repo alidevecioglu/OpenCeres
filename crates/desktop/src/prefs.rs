@@ -66,9 +66,6 @@ pub struct Prefs {
     pub update_check: bool,
     /// Unix time of the last update check that found nothing new (0 = never).
     pub update_last_check: u64,
-    /// Unix time of the last background MPCORB check that found the
-    /// catalogue current (0 = never).
-    pub mpcorb_last_check: u64,
 }
 
 impl Default for Prefs {
@@ -86,7 +83,6 @@ impl Default for Prefs {
             known_source: KnownSource::SkyBot,
             update_check: true,
             update_last_check: 0,
-            mpcorb_last_check: 0,
         }
     }
 }
@@ -109,9 +105,6 @@ impl Prefs {
                 "update_last_check" => {
                     p.update_last_check = value.parse().unwrap_or(p.update_last_check);
                 }
-                "mpcorb_last_check" => {
-                    p.mpcorb_last_check = value.parse().unwrap_or(p.mpcorb_last_check);
-                }
                 _ => {}
             }
         }
@@ -122,8 +115,8 @@ impl Prefs {
         let mut out = String::new();
         settings::write(&self, &mut out);
         out += &format!(
-            "panel_open={}\nupdate_last_check={}\nmpcorb_last_check={}\n",
-            self.panel_open, self.update_last_check, self.mpcorb_last_check
+            "panel_open={}\nupdate_last_check={}\n",
+            self.panel_open, self.update_last_check
         );
         out
     }
@@ -188,7 +181,6 @@ mod tests {
             known_source: KnownSource::Mpcorb,
             update_check: false,
             update_last_check: 1_793_279_073,
-            mpcorb_last_check: 1_793_279_000,
         };
         assert_eq!(Prefs::parse(&p.to_text()), p);
     }

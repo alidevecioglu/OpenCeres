@@ -13,7 +13,8 @@
 //! its own window and exits. `OPENCERES_SCREENSHOT_STATE` is a comma list of:
 //! `light`, `dark`, `stars`, `invert`, `noalign` (frames as stored), `grid`, `panel`, `settings` (or
 //! `settings=PAGE`, e.g. `settings=updates`), `search=TEXT` (in Settings),
-//! `update=VERSION` (pretend that version is available), `help`, `history`
+//! `update=VERSION` (pretend that version is available), `offers` (the box
+//! offering updates; use with `update=`), `help`, `history`
 //! or `history=SET` (the history window, with SET's search opened;
 //! screenshots leave the history alone unless `OPENCERES_HISTORY_DIR` gives
 //! them a folder), `paused`, `frame=N`
@@ -39,6 +40,7 @@ pub struct State {
     pub settings_page: Option<String>,
     pub search: Option<String>,
     pub update: Option<String>,
+    pub offers: bool,
     pub help: bool,
     /// The history window, with the first search of this set opened ("" = none).
     pub history: Option<String>,
@@ -109,6 +111,7 @@ impl State {
                 }
                 "search" => s.search = Some(value.to_owned()),
                 "update" => s.update = Some(value.to_owned()).filter(|v| !v.is_empty()),
+                "offers" => s.offers = true,
                 "help" => s.help = true,
                 "history" => s.history = Some(value.to_owned()),
                 "paused" => s.paused = true,
