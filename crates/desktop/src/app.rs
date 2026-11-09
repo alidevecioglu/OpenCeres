@@ -147,6 +147,14 @@ struct Drag {
     moved: bool,
 }
 
+/// A grid size waiting for the student's yes.
+#[derive(Clone, Copy)]
+struct GridChange {
+    size: usize,
+    /// Asked for in Settings, so accepting also changes the default.
+    from_settings: bool,
+}
+
 pub struct App {
     /// Defaults and the side panel state, saved when they change.
     prefs: Prefs,
@@ -168,12 +176,23 @@ pub struct App {
     grid_size: usize,
     /// Marked report boxes as (row, column), 1-based from the top-left.
     marks: Vec<(usize, usize)>,
+    /// Those of `marks` added for an object rather than clicked: they go
+    /// when the last object in them is deleted.
+    object_boxes: Vec<(usize, usize)>,
     copied: bool,
+    /// What the last deletion or Clear removed (one level; see `Undo`).
+    undo: Option<objects_ui::Undo>,
+    /// A grid size asked for while boxes are marked, awaiting confirmation.
+    grid_change: Option<GridChange>,
     /// Objects marked frame by frame (the detailed report), indexed like
     /// the set's frames.
     objects: Vec<Tagged>,
     /// The object being marked (index into `objects`).
     marking: Option<usize>,
+    /// While editing a finished object: how it was before.
+    editing: Option<Tagged>,
+    /// How the last mark was placed.
+    snap: Option<objects_ui::Snap>,
     report_note: Option<String>,
     report_error: Option<String>,
     export: Option<objects_ui::Export>,
@@ -241,7 +260,7 @@ fn shortcuts() -> Vec<(Vec<String>, &'static str)> {
         (keys(&["Enter"]), "While marking: use the predicted spot"),
         (keys(&["K"]), "Known objects in the field"),
         (keys(&["H"]), "Search history"),
-        (keys(&["Tab"]), "Side panel (or \\)"),
+        (keys(&["\\"]), "Side panel"),
         (vec!["O".into(), format!("{cmd}O")], "Open an image set"),
         (vec![format!("{cmd},")], "Settings"),
         (keys(&["?"]), "This list"),
@@ -297,9 +316,14 @@ impl App {
             grid_on: prefs.show_grid,
             grid_size: prefs.grid_size,
             marks: Vec::new(),
+            object_boxes: Vec::new(),
             copied: false,
+            undo: None,
+            grid_change: None,
             objects: Vec::new(),
             marking: None,
+            editing: None,
+            snap: None,
             report_note: None,
             report_error: None,
             export: None,
@@ -355,6 +379,13 @@ impl App {
             return;
         }
         let any = !paths.is_empty();
+        let paths = match load::expand_folders(paths) {
+            Ok(paths) => paths,
+            Err(e) => {
+                self.error = Some(e);
+                return;
+            }
+        };
         let files: Vec<String> = paths
             .into_iter()
             .filter(|p| load::has_extension(p, &load::OPENABLE_EXTENSIONS))
@@ -407,6 +438,19 @@ impl App {
         }
     }
 
+    fn choose_folder(&mut self, ctx: &egui::Context, frame: &eframe::Frame) {
+        if self.loading.is_some() {
+            return;
+        }
+        let picked = rfd::FileDialog::new()
+            .set_title("Open a folder of FITS images")
+            .set_parent(frame)
+            .pick_folder();
+        if let Some(path) = picked {
+            self.open(ctx, vec![path.to_string_lossy().into_owned()]);
+        }
+    }
+
     fn poll_loading(&mut self, now: f64) {
         let Some(loading) = &self.loading else { return };
         let result = match loading.rx.try_recv() {
@@ -430,9 +474,14 @@ impl App {
                     paths,
                 });
                 self.marks.clear();
+                self.object_boxes.clear();
                 self.copied = false;
+                self.undo = None;
+                self.grid_change = None;
                 self.objects.clear();
                 self.marking = None;
+                self.editing = None;
+                self.snap = None;
                 self.reviews.clear();
                 self.report_note = None;
                 self.report_error = None;
@@ -495,11 +544,70 @@ impl App {
     }
 
     fn set_grid_size(&mut self, n: usize) {
+        self.grid_change = None;
         if n != self.grid_size {
             self.marks.clear(); // box labels mean different areas now
+            self.object_boxes.clear();
             self.copied = false;
+            self.undo = None;
+            self.grid_size = n;
+            self.rederive_cells();
         }
-        self.grid_size = n;
+    }
+
+    /// Changes the grid, first asking (see [`Self::grid_change_row`]) when
+    /// that would clear marked boxes.
+    fn request_grid_size(&mut self, size: usize, from_settings: bool) {
+        if self.marks.is_empty() {
+            self.set_grid_size(size);
+        } else {
+            self.grid_change = Some(GridChange {
+                size,
+                from_settings,
+            });
+        }
+    }
+
+    /// `Changing the grid clears 3 boxes.  [Change] [Keep]`, wherever the
+    /// change was asked for.
+    fn grid_change_row(&mut self, ui: &mut egui::Ui) {
+        let Some(change) = self.grid_change else {
+            return;
+        };
+        let p = palette(ui);
+        let n = self.marks.len();
+        if n == 0 {
+            // The boxes went while the question was up: nothing left to lose.
+            self.accept_grid_change(change);
+            return;
+        }
+        let boxes = if n == 1 { "box" } else { "boxes" };
+        ui.add(
+            Label::new(
+                RichText::new(format!("Changing the grid clears {n} {boxes}.")).color(p.text),
+            )
+            .wrap(),
+        );
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = S2;
+            if ui
+                .button("Change")
+                .on_hover_text(format!("Use a {0}×{0} grid", change.size))
+                .clicked()
+            {
+                self.accept_grid_change(change);
+            }
+            if ui.button("Keep").clicked() {
+                self.grid_change = None;
+            }
+        });
+    }
+
+    fn accept_grid_change(&mut self, change: GridChange) {
+        self.set_grid_size(change.size);
+        if change.from_settings {
+            self.prefs.grid_size = change.size;
+        }
     }
 
     fn report(&self) -> String {
@@ -747,7 +855,12 @@ impl App {
             self.invert = p.invert;
         }
         if p.grid_size != before.grid_size {
-            self.set_grid_size(p.grid_size);
+            if self.marks.is_empty() {
+                self.set_grid_size(p.grid_size);
+            } else {
+                self.prefs.grid_size = before.grid_size;
+                self.request_grid_size(p.grid_size, true);
+            }
         }
         if p.align != before.align {
             self.align_on = p.align;
@@ -880,7 +993,7 @@ impl App {
             let m = i.modifiers;
             (i.events.clone(), i.time, m.command || m.ctrl || m.mac_cmd)
         });
-        let mut handled = false;
+        let widget_focused = ctx.memory(|m| m.focused().is_some());
         for event in events {
             match event {
                 Event::Key {
@@ -899,9 +1012,8 @@ impl App {
                                 self.team.window_open = false;
                                 self.help_open = false;
                             }
-                            _ => continue,
+                            _ => {}
                         }
-                        handled = true;
                         continue;
                     }
                     if key == Key::Escape && (self.help_open || self.modal_open()) {
@@ -909,76 +1021,52 @@ impl App {
                         self.settings_open = false;
                         self.searches.window_open = false;
                         self.team.window_open = false;
-                        handled = true;
                     } else if key == Key::Escape && self.marking.is_some() {
                         self.finish_marking();
-                        handled = true;
                     }
                     if self.modal_open() || modifiers.alt || command {
                         continue;
                     }
-                    handled |= match key {
-                        Key::Space => {
-                            self.toggle_play(now);
-                            true
-                        }
-                        Key::ArrowLeft => {
-                            self.step(-1);
-                            true
-                        }
-                        Key::ArrowRight => {
-                            self.step(1);
-                            true
-                        }
-                        Key::Enter if self.marking.is_some() => {
-                            self.accept_prediction();
-                            true
-                        }
-                        Key::Tab if !modifiers.shift => {
-                            self.prefs.panel_open = !self.prefs.panel_open;
-                            true
-                        }
-                        _ => false,
-                    };
-                }
-                // Characters, not keys, so `,` `.` `+` `?` work on any layout.
-                Event::Text(text) if !self.modal_open() && !command_held => {
-                    handled = true;
-                    match text.as_str() {
-                        "+" | "=" => self.zoom_by(1.25, None),
-                        "-" | "_" => self.zoom_by(0.8, None),
-                        "0" => self.fit(),
-                        "s" | "S" => self.show_stars = !self.show_stars,
-                        "i" | "I" => self.invert = !self.invert,
-                        "a" | "A" => self.align_on = !self.align_on,
-                        "g" | "G" => self.set_grid(!self.grid_on),
-                        "m" | "M" if self.set.is_some() => self.start_marking(),
-                        "k" | "K" => self.set_known(!self.known_on),
-                        "h" | "H" => self.toggle_history(),
-                        "," | "[" => self.change_speed(1, now),
-                        "." | "]" => self.change_speed(-1, now),
-                        "o" | "O" => self.choose(ctx, frame),
-                        "?" => self.help_open = !self.help_open,
-                        "\\" => self.prefs.panel_open = !self.prefs.panel_open,
-                        t => match t.parse::<usize>() {
-                            Ok(n @ 1..=9) if n <= self.frame_count() => {
-                                self.playing = false;
-                                self.index = n - 1;
-                            }
-                            _ => handled = false,
-                        },
+                    // A control reached with Tab uses these keys itself
+                    // (Space and Enter press it, arrows move the focus).
+                    if widget_focused {
+                        continue;
+                    }
+                    match key {
+                        Key::Space => self.toggle_play(now),
+                        Key::ArrowLeft => self.step(-1),
+                        Key::ArrowRight => self.step(1),
+                        Key::Enter if self.marking.is_some() => self.accept_prediction(),
+                        _ => {}
                     }
                 }
+                // Characters, not keys, so `,` `.` `+` `?` work on any layout.
+                Event::Text(text) if !self.modal_open() && !command_held => match text.as_str() {
+                    "+" | "=" => self.zoom_by(1.25, None),
+                    "-" | "_" => self.zoom_by(0.8, None),
+                    "0" => self.fit(),
+                    "s" | "S" => self.show_stars = !self.show_stars,
+                    "i" | "I" => self.invert = !self.invert,
+                    "a" | "A" => self.align_on = !self.align_on,
+                    "g" | "G" => self.set_grid(!self.grid_on),
+                    "m" | "M" if self.set.is_some() => self.start_marking(),
+                    "k" | "K" => self.set_known(!self.known_on),
+                    "h" | "H" => self.toggle_history(),
+                    "," | "[" => self.change_speed(1, now),
+                    "." | "]" => self.change_speed(-1, now),
+                    "o" | "O" => self.choose(ctx, frame),
+                    "?" => self.help_open = !self.help_open,
+                    "\\" => self.prefs.panel_open = !self.prefs.panel_open,
+                    t => match t.parse::<usize>() {
+                        Ok(n @ 1..=9) if n <= self.frame_count() => {
+                            self.playing = false;
+                            self.index = n - 1;
+                        }
+                        _ => {}
+                    },
+                },
                 _ => {}
             }
-        }
-        if handled {
-            // Keep Space/arrows/Tab from also acting on whatever has focus.
-            ctx.memory_mut(|m| {
-                if let Some(id) = m.focused() {
-                    m.surrender_focus(id);
-                }
-            });
         }
     }
 
@@ -1095,6 +1183,27 @@ impl App {
                 self.index = i;
             }
         }
+        let at = |n: Option<usize>| n.and_then(|n| n.checked_sub(1));
+        if let Some(i) = at(s.edit) {
+            self.edit_object(i);
+        }
+        if let Some(i) = at(s.delete) {
+            self.delete_object(i);
+        }
+        if s.clear {
+            self.clear_boxes();
+        }
+        if let Some(n) = s.ask_grid.filter(|n| GRID_SIZES.contains(n)) {
+            self.request_grid_size(n, s.settings);
+        }
+        self.snap = match s.snap.as_deref() {
+            Some("source") => Some(objects_ui::Snap::Source),
+            Some("clicked") => Some(objects_ui::Snap::Clicked),
+            _ => None,
+        };
+        if s.expired {
+            self.team_capture_expired();
+        }
         if let Some(Ok(records)) = s.report.as_deref().map(read) {
             self.review_note = Some(self.show_reports(records));
         }
@@ -1157,6 +1266,12 @@ impl App {
                     if open.clicked() {
                         self.choose(ui.ctx(), frame);
                     }
+                    let folder = ui
+                        .add_enabled(self.loading.is_none(), Button::new("Folder…"))
+                        .on_hover_text("Open a folder of FITS images");
+                    if folder.clicked() {
+                        self.choose_folder(ui.ctx(), frame);
+                    }
                     ui.add_space(S3);
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         // Right to left: the last item added is the leftmost.
@@ -1166,7 +1281,7 @@ impl App {
                             self.settings_open = !self.settings_open;
                         }
                         let panel = icons::button(ui, Icon::Sidebar, self.prefs.panel_open, true)
-                            .on_hover_text("Report panel (Tab)");
+                            .on_hover_text("Report panel (\\)");
                         if panel.clicked() {
                             self.prefs.panel_open = !self.prefs.panel_open;
                         }
@@ -1237,8 +1352,8 @@ impl App {
             valign: Align::Center,
             ..Default::default()
         };
-        job.append(name, 0.0, format(13.5, p.text));
-        job.append(&set.summary, S3, format(12.5, p.muted));
+        job.append(name, 0.0, format(13.0, p.text));
+        job.append(&set.summary, S3, format(12.0, p.muted));
         ui.add(Label::new(job).truncate())
             .on_hover_text(format!("{name} · {}", set.summary));
     }
@@ -1247,10 +1362,10 @@ impl App {
     fn blink_controls(&mut self, ui: &mut egui::Ui) {
         let p = palette(ui);
         let now = ui.input(|i| i.time);
-        let speed_tip = "Blink speed, seconds per frame ( , slower · . faster )";
+        let speed_tip = "Seconds per frame ( , slower · . faster )";
         let secs = self.blink_seconds;
         if icons::button(ui, Icon::Plus, false, secs > SPEEDS[0])
-            .on_hover_text(speed_tip)
+            .on_hover_text("Faster: shorter time on each frame (.)")
             .clicked()
         {
             self.change_speed(-1, now);
@@ -1261,7 +1376,7 @@ impl App {
         )
         .on_hover_text(speed_tip);
         if icons::button(ui, Icon::Minus, false, secs < SPEEDS[SPEEDS.len() - 1])
-            .on_hover_text(speed_tip)
+            .on_hover_text("Slower: longer time on each frame (,)")
             .clicked()
         {
             self.change_speed(1, now);
@@ -1385,6 +1500,7 @@ impl App {
                 ui.horizontal_centered(|ui| {
                     ui.spacing_mut().item_spacing.x = S4;
                     let small = |t: String| RichText::new(t).small().color(p.muted);
+                    let mono = |t: String| RichText::new(t).monospace().color(p.muted);
                     let current = self.current();
                     if let Some((vx, vy)) = self.hover {
                         // The frame's own pixels, as in the file.
@@ -1392,7 +1508,7 @@ impl App {
                             .placement(self.index)
                             .inverse()
                             .map_or((vx, vy), |t| t.apply(vx, vy));
-                        ui.label(small(format!("x {}  y {}", x.round(), y.round())));
+                        ui.label(mono(format!("x {}  y {}", x.round(), y.round())));
                         let sky = current.and_then(|f| f.wcs.as_ref()).map_or_else(
                             || "No sky coordinates in this image".to_owned(),
                             |wcs| {
@@ -1400,7 +1516,7 @@ impl App {
                                 format!("RA {}   Dec {}", format::ra(ra), format::dec(dec))
                             },
                         );
-                        ui.label(small(sky));
+                        ui.label(mono(sky));
                     } else if self.set.is_some() {
                         ui.label(small("Point at the image for coordinates".into()));
                     }
@@ -1533,8 +1649,9 @@ impl App {
             .map(|&n| (n, format!("{n}×{n}")))
             .collect();
         if segmented(ui, &mut size, &options, ui.available_width()) {
-            self.set_grid_size(size);
+            self.request_grid_size(size, false);
         }
+        self.grid_change_row(ui);
 
         if self.marks.is_empty() {
             let hint = if loaded {
@@ -1581,15 +1698,25 @@ impl App {
                 Button::new("Clear").min_size(vec2(w, theme::TOOL)),
             );
             if clear.clicked() {
-                self.marks.clear();
-                self.copied = false;
+                self.clear_boxes();
             }
         });
+        let undo = match &self.undo {
+            Some(objects_ui::Undo::Boxes { marks, .. }) => Some(match marks.len() {
+                1 => "Cleared 1 box".to_owned(),
+                n => format!("Cleared {n} boxes"),
+            }),
+            _ => None,
+        };
+        if undo.is_some_and(|text| undo_row(ui, &text)) {
+            self.apply_undo();
+        }
     }
 
     fn stage(&mut self, ui: &mut egui::Ui, frame: &eframe::Frame) {
         let rect = ui.available_rect_before_wrap();
-        let response = ui.allocate_rect(rect, Sense::click_and_drag());
+        // Not focusable: Tab should go through the controls, not stop here.
+        let response = ui.allocate_rect(rect, Sense::CLICK | Sense::DRAG);
         if rect.size() != self.view.stage {
             self.resize_stage(rect.size());
         }
@@ -1728,12 +1855,16 @@ impl App {
             && let Some(f) = self.current()
         {
             let visible = rect.expand(12.0);
-            let stroke = Stroke::new(1.25, theme::STAR);
+            let ov = theme::overlay(self.invert);
+            let stroke = Stroke::new(1.25, ov.star);
+            let halo = Stroke::new(1.25 + 2.0, ov.halo);
             for s in &f.stars {
                 let (x, y) = placement.apply(f64::from(s.x), f64::from(s.y));
                 let c = origin + vec2(x as f32 + 0.5, h - 0.5 - y as f32) * scale;
                 if visible.contains(c) {
-                    painter.circle_stroke(c, (s.fwhm * 1.5 * scale).max(4.0), stroke);
+                    let r = (s.fwhm * 1.5 * scale).max(4.0);
+                    painter.circle_stroke(c, r, halo);
+                    painter.circle_stroke(c, r, stroke);
                 }
             }
         }
@@ -1757,7 +1888,8 @@ impl App {
         let scale = self.view.scale;
         let arcsec = f.wcs.as_ref().map_or(0.25, |w| w.pixel_scale()) as f32;
         let r = (6.0 / arcsec * scale).max(10.0);
-        let font = FontId::proportional(11.5);
+        let font = FontId::proportional(12.0);
+        let ov = theme::overlay(self.invert);
         let labels = scale >= 0.1;
         let mut taken: Vec<Rect> = Vec::new();
         let visible = rect.expand(r + 4.0);
@@ -1777,8 +1909,8 @@ impl App {
             }
             let focused = Some(i) == self.known_focus;
             let width = if focused { 2.25 } else { 1.5 };
-            painter.circle_stroke(c, r, Stroke::new(width + 2.0, theme::KNOWN_HALO));
-            painter.circle_stroke(c, r, Stroke::new(width, theme::KNOWN));
+            painter.circle_stroke(c, r, Stroke::new(width + 2.0, ov.halo));
+            painter.circle_stroke(c, r, Stroke::new(width, ov.known));
             if labels {
                 chips.push((c, known_chip_text(&o.object), focused));
             }
@@ -1786,7 +1918,7 @@ impl App {
         // Labels after all rings, focused one first so it always shows.
         chips.sort_by_key(|&(_, _, focused)| !focused);
         for (c, text, _) in chips {
-            let galley = painter.layout_no_wrap(text, font.clone(), theme::KNOWN_TEXT);
+            let galley = painter.layout_no_wrap(text, font.clone(), ov.known_text);
             // Up and right of the ring, flipped where that leaves the stage.
             let d = r * std::f32::consts::FRAC_1_SQRT_2;
             let size = vec2(galley.size().x + S2, 17.0);
@@ -1802,9 +1934,9 @@ impl App {
                 continue;
             }
             taken.push(chip);
-            painter.rect_filled(chip, 3.0, theme::GRID_CHIP);
+            painter.rect_filled(chip, 3.0, ov.chip);
             let at = pos2(chip.min.x + S1, chip.center().y - galley.size().y / 2.0);
-            painter.galley(at, galley, theme::KNOWN_TEXT);
+            painter.galley(at, galley, ov.known_text);
         }
     }
 
@@ -1974,6 +2106,7 @@ impl App {
         let key = grid_box(u, v, self.grid_size);
         if let Some(i) = self.marks.iter().position(|&m| m == key) {
             self.marks.remove(i);
+            self.object_boxes.retain(|&m| m != key);
         } else {
             self.marks.push(key);
         }
@@ -1983,6 +2116,7 @@ impl App {
     fn paint_grid(&self, painter: &egui::Painter, image: Rect) {
         let n = self.grid_size;
         let cell = image.size() / n as f32;
+        let ov = theme::overlay(self.invert);
         for &(r, c) in &self.marks {
             let min = image.min + vec2((c - 1) as f32 * cell.x, (r - 1) as f32 * cell.y);
             let rect = Rect::from_min_size(min, cell);
@@ -1992,14 +2126,14 @@ impl App {
                 painter.rect_stroke(
                     rect.shrink(1.0),
                     0.0,
-                    Stroke::new(2.0, theme::GRID_TEXT),
+                    Stroke::new(2.0, ov.grid_text),
                     StrokeKind::Inside,
                 );
             } else {
-                painter.rect_filled(rect, 0.0, theme::GRID_FILL);
+                painter.rect_filled(rect, 0.0, ov.grid_fill);
             }
         }
-        let stroke = Stroke::new(1.0, theme::GRID_LINE);
+        let stroke = Stroke::new(1.0, ov.grid_line);
         for i in 0..=n {
             let x = image.min.x + i as f32 * cell.x;
             let y = image.min.y + i as f32 * cell.y;
@@ -2009,7 +2143,7 @@ impl App {
         if cell.min_elem() < 36.0 {
             return; // too small to label legibly
         }
-        let font = FontId::proportional(11.5);
+        let font = FontId::proportional(12.0);
         for r in 1..=n {
             for c in 1..=n {
                 let at = image.min
@@ -2017,12 +2151,11 @@ impl App {
                         (c - 1) as f32 * cell.x + S1 + 1.0,
                         (r - 1) as f32 * cell.y + S1 + 1.0,
                     );
-                let galley =
-                    painter.layout_no_wrap(box_label((r, c)), font.clone(), theme::GRID_TEXT);
+                let galley = painter.layout_no_wrap(box_label((r, c)), font.clone(), ov.grid_text);
                 let chip = Rect::from_min_size(at, vec2(galley.size().x + S2, 17.0));
-                painter.rect_filled(chip, 3.0, theme::GRID_CHIP);
+                painter.rect_filled(chip, 3.0, ov.chip);
                 let text_at = pos2(at.x + S1, chip.center().y - galley.size().y / 2.0);
-                painter.galley(text_at, galley, theme::GRID_TEXT);
+                painter.galley(text_at, galley, ov.grid_text);
             }
         }
     }
@@ -2037,7 +2170,7 @@ impl App {
             format::clock(f.date_obs.as_deref(), f.mjd_obs)
         );
         let painter = ui.painter_at(rect);
-        let galley = painter.layout_no_wrap(text, FontId::proportional(11.5), theme::BADGE_TEXT);
+        let galley = painter.layout_no_wrap(text, FontId::monospace(12.0), theme::BADGE_TEXT);
         let size = galley.size() + vec2(2.0 * S2, 2.0 * S1);
         let chip = Rect::from_min_size(pos2(rect.min.x + S3, rect.max.y - S3 - size.y), size);
         painter.rect_filled(chip, theme::RADIUS, theme::BADGE);
@@ -2048,7 +2181,7 @@ impl App {
         let p = palette(ui);
         let size = vec2(
             440.0f32.min(rect.width() - 2.0 * S4),
-            216.0f32.min(rect.height() - 2.0 * S4),
+            240.0f32.min(rect.height() - 2.0 * S4),
         );
         if size.x < 200.0 || size.y < 120.0 {
             return;
@@ -2063,7 +2196,7 @@ impl App {
         ui.painter()
             .rect(card, theme::RADIUS, fill, stroke, StrokeKind::Inside);
 
-        let mut choose = false;
+        let (mut choose, mut pick_folder) = (false, false);
         ui.scope_builder(
             UiBuilder::new()
                 .max_rect(card.shrink2(vec2(S5, S5)))
@@ -2078,20 +2211,34 @@ impl App {
                 } else {
                     "Drop your IASC image set here"
                 };
-                ui.label(RichText::new(title).size(17.0).color(p.text));
+                ui.label(RichText::new(title).heading().color(p.text));
                 ui.label(
-                    RichText::new("The .zip from IASC, or 3–4 FITS images of the same field")
-                        .color(p.muted),
+                    RichText::new(
+                        "The .zip from IASC, a folder, or 3–4 FITS images of the same field",
+                    )
+                    .color(p.muted),
                 );
                 ui.add_space(S4);
-                let button = ui.add_enabled(
-                    self.loading.is_none(),
-                    Button::new(RichText::new("Choose files…").color(p.accent_text))
-                        .fill(p.accent)
-                        .stroke(Stroke::NONE)
-                        .min_size(vec2(132.0, 30.0)),
+                ui.allocate_ui_with_layout(
+                    vec2(272.0, 30.0),
+                    Layout::left_to_right(Align::Center),
+                    |ui| {
+                        ui.spacing_mut().item_spacing.x = S2;
+                        let button = ui.add_enabled(
+                            self.loading.is_none(),
+                            Button::new(RichText::new("Choose files…").color(p.accent_text))
+                                .fill(p.accent)
+                                .stroke(Stroke::NONE)
+                                .min_size(vec2(132.0, 30.0)),
+                        );
+                        choose = button.clicked();
+                        let folder = ui.add_enabled(
+                            self.loading.is_none(),
+                            Button::new("Choose folder…").min_size(vec2(132.0, 30.0)),
+                        );
+                        pick_folder = folder.clicked();
+                    },
                 );
-                choose = button.clicked();
                 ui.add_space(S4);
                 ui.label(
                     RichText::new("O open  ·  Space blink  ·  ← → step  ·  ? all shortcuts")
@@ -2102,6 +2249,9 @@ impl App {
         );
         if choose {
             self.choose(ui.ctx(), frame);
+        }
+        if pick_folder {
+            self.choose_folder(ui.ctx(), frame);
         }
     }
 
@@ -2121,10 +2271,12 @@ impl App {
             .show(ui.ctx(), |ui| {
                 let (r, _) = ui.allocate_exact_size(rect.size(), Sense::click_and_drag());
                 let painter = ui.painter();
-                let font = FontId::proportional(15.0);
+                let font = FontId::proportional(16.0);
+                // Enough dim for the white text over an inverted (white) image.
+                let dim = if self.invert { 200 } else { 90 };
                 if dropping {
                     let zone = r.shrink(S3);
-                    painter.rect_filled(zone, theme::RADIUS, Color32::from_black_alpha(90));
+                    painter.rect_filled(zone, theme::RADIUS, Color32::from_black_alpha(dim));
                     painter.rect_stroke(
                         zone,
                         theme::RADIUS,
@@ -2139,7 +2291,7 @@ impl App {
                         theme::OVERLAY_TEXT,
                     );
                 } else {
-                    painter.rect_filled(r, 0.0, Color32::from_black_alpha(120));
+                    painter.rect_filled(r, 0.0, Color32::from_black_alpha(dim.max(120)));
                     let galley =
                         painter.layout_no_wrap(message.to_owned(), font, theme::OVERLAY_TEXT);
                     let total = 18.0 + 10.0 + galley.size().x;
@@ -2171,7 +2323,11 @@ impl App {
                     .show(ui, |ui| {
                         ui.set_width(300.0);
                         ui.horizontal(|ui| {
-                            ui.label(RichText::new("Keyboard shortcuts").strong().color(p.text));
+                            ui.label(
+                                RichText::new("Keyboard shortcuts")
+                                    .family(theme::semibold())
+                                    .color(p.text),
+                            );
                             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                                 if icons::small_button(ui, Icon::Close, p.muted)
                                     .on_hover_text("Close (?)")
@@ -2355,7 +2511,7 @@ fn known_row(ui: &mut egui::Ui, o: &KnownObject, detail: &str, selected: bool) -
     }
     one_line(&mut title, inner.width() - mag.size().x - S2);
     let mut sub = LayoutJob::default();
-    sub.append(detail, 0.0, format(11.5, p.muted));
+    sub.append(detail, 0.0, format(12.0, p.muted));
     one_line(&mut sub, inner.width());
     let title = painter.layout_job(title);
     let sub = painter.layout_job(sub);
@@ -2455,7 +2611,11 @@ fn segmented<T: Copy + PartialEq>(
                     let selected = *option == *value;
                     let text = RichText::new(label).size(12.0);
                     let (text, fill, stroke) = if selected {
-                        (text.color(p.text), p.panel, Stroke::new(1.0, p.border))
+                        (
+                            text.color(p.text),
+                            p.panel,
+                            Stroke::new(1.0, p.border_strong),
+                        )
                     } else {
                         (text.color(p.muted), Color32::TRANSPARENT, Stroke::NONE)
                     };
@@ -2488,7 +2648,7 @@ fn update_pill(ui: &mut egui::Ui, text: &str) -> Response {
 fn section_heading(ui: &mut egui::Ui, title: &str, count: Option<usize>) {
     let p = palette(ui);
     ui.horizontal(|ui| {
-        ui.label(RichText::new(title).strong().color(p.text));
+        ui.label(RichText::new(title).family(theme::semibold()).color(p.text));
         if let Some(n) = count {
             Frame::new()
                 .fill(p.accent_weak)
@@ -2499,6 +2659,18 @@ fn section_heading(ui: &mut egui::Ui, title: &str, count: Option<usize>) {
                 });
         }
     });
+}
+
+/// `Deleted A · Undo`, right after what it undoes; true when clicked.
+fn undo_row(ui: &mut egui::Ui, text: &str) -> bool {
+    let p = palette(ui);
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = S1;
+        ui.label(RichText::new(format!("{text} ·")).small().color(p.muted));
+        ui.link(RichText::new("Undo").small().color(p.accent))
+            .clicked()
+    })
+    .inner
 }
 
 fn muted_wrapped(ui: &mut egui::Ui, text: &str) {
@@ -2538,7 +2710,7 @@ fn keycap(ui: &mut egui::Ui, key: &str) {
         .corner_radius(4)
         .inner_margin(Margin::symmetric(5, 0))
         .show(ui, |ui| {
-            ui.label(RichText::new(key).size(11.5).color(p.text));
+            ui.label(RichText::new(key).size(12.0).color(p.text));
         });
 }
 
@@ -2547,20 +2719,33 @@ fn hline(ui: &mut egui::Ui, color: Color32) {
     ui.painter().rect_filled(rect, 0.0, color);
 }
 
-/// The app's mark: a dark disc crossed by a bright streak.
+/// The app's mark: one object caught on three frames, three amber dots on a
+/// rising line with the last one ringed, on a navy tile. Draws the geometry
+/// and size ladder of the icon files (`assets/make_icons.py`) so that the app
+/// and its icon are the same picture.
 fn paint_logo(ui: &egui::Ui, rect: Rect) {
-    let p = palette(ui);
+    const NAVY: Color32 = Color32::from_rgb(0x0d, 0x16, 0x36);
+    const STAR: Color32 = Color32::from_rgb(0xe8, 0xec, 0xf7);
     let s = rect.width() / 32.0;
+    let pixels = rect.width() * ui.ctx().pixels_per_point();
     let at = |x: f32, y: f32| rect.min + vec2(x, y) * s;
     let painter = ui.painter();
-    painter.circle_filled(at(16.0, 16.0), 13.0 * s, p.disc);
-    painter.line_segment(
-        [at(9.0, 23.0), at(21.0, 11.0)],
-        Stroke::new(3.0 * s, theme::STREAK),
-    );
-    let cap = 1.5 * s;
-    painter.circle_filled(at(9.0, 23.0), cap, theme::STREAK);
-    painter.circle_filled(at(21.0, 11.0), cap, theme::STREAK);
+    painter.rect_filled(rect, 7.2 * s, NAVY);
+    if pixels < 32.0 {
+        for (x, y) in [(8.0, 24.0), (16.0, 16.0), (24.0, 8.0)] {
+            painter.circle_filled(at(x, y), 3.0 * s, theme::STREAK);
+        }
+        return;
+    }
+    if pixels >= 128.0 {
+        for (x, y, r) in [(9.5, 8.5, 0.6), (25.5, 23.5, 0.45)] {
+            painter.circle_filled(at(x, y), r * s, STAR.gamma_multiply(0.55));
+        }
+    }
+    for (x, y) in [(7.0, 25.0), (14.0, 18.0), (21.0, 11.0)] {
+        painter.circle_filled(at(x, y), 2.25 * s, theme::STREAK);
+    }
+    painter.circle_stroke(at(21.0, 11.0), 5.5 * s, Stroke::new(1.5 * s, theme::STREAK));
 }
 
 #[cfg(test)]

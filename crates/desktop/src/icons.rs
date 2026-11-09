@@ -1,6 +1,8 @@
 //! Toolbar icons drawn as vector shapes, so they are crisp at any scale and
 //! do not depend on which glyphs the built-in font has. Each icon is laid
-//! out on a 16 × 16 point grid centred in its rect.
+//! out on a 16 × 16 point grid centred in its rect, with everything (strokes
+//! included) inside the central 14 points, in 1.5-point strokes and 1.25 for
+//! interior detail.
 
 use std::f32::consts::{FRAC_PI_2, TAU};
 
@@ -38,16 +40,18 @@ pub enum Icon {
 
 pub fn paint(painter: &egui::Painter, rect: Rect, icon: Icon, color: Color32) {
     let c = rect.center();
-    // 16-point grid, scaled down when the rect is smaller.
+    // 16-point grid, scaled down when the rect is smaller. Strokes scale with
+    // the geometry so that an icon keeps its weight at every size.
     let s = (rect.width().min(rect.height()) / 16.0).min(1.0);
     let at = |x: f32, y: f32| c + vec2(x, y) * s;
-    let stroke = Stroke::new(1.5, color);
+    let stroke = Stroke::new(1.5 * s, color);
+    let detail = Stroke::new(1.25 * s, color);
     match icon {
         Icon::Prev | Icon::Next => {
             let d = if icon == Icon::Prev { 1.0 } else { -1.0 };
             painter.line(
                 vec![at(2.5 * d, -5.0), at(-2.5 * d, 0.0), at(2.5 * d, 5.0)],
-                Stroke::new(1.75, color),
+                stroke,
             );
         }
         Icon::Play => {
@@ -60,7 +64,7 @@ pub fn paint(painter: &egui::Painter, rect: Rect, icon: Icon, color: Color32) {
         Icon::Pause => {
             for dx in [-2.75, 2.75] {
                 let bar = Rect::from_center_size(at(dx, 0.0), vec2(3.0, 11.0) * s);
-                painter.rect_filled(bar, 1.0, color);
+                painter.rect_filled(bar, 1.0 * s, color);
             }
         }
         Icon::Minus | Icon::Plus => {
@@ -71,10 +75,10 @@ pub fn paint(painter: &egui::Painter, rect: Rect, icon: Icon, color: Color32) {
         }
         Icon::Stars => {
             // A detection ring around a star, with reticle ticks.
-            painter.circle_stroke(c, 4.5 * s, stroke);
+            painter.circle_stroke(c, 4.0 * s, stroke);
             painter.circle_filled(c, 1.5 * s, color);
             for (dx, dy) in [(1.0, 0.0), (-1.0, 0.0), (0.0, 1.0), (0.0, -1.0)] {
-                painter.line_segment([at(dx * 6.0, dy * 6.0), at(dx * 7.5, dy * 7.5)], stroke);
+                painter.line_segment([at(dx * 5.5, dy * 5.5), at(dx * 7.0, dy * 7.0)], detail);
             }
         }
         Icon::Invert => {
@@ -90,59 +94,56 @@ pub fn paint(painter: &egui::Painter, rect: Rect, icon: Icon, color: Color32) {
         }
         Icon::Align => {
             // A faint ring sliding onto a solid one: a star brought into line.
-            let off = at(-3.0, -3.0);
-            painter.circle_stroke(off, 3.75 * s, Stroke::new(1.25, color.gamma_multiply(0.45)));
-            let c = at(1.5, 1.5);
-            painter.circle_stroke(c, 3.75 * s, stroke);
+            let off = at(-2.5, -2.5);
+            painter.circle_stroke(
+                off,
+                3.5 * s,
+                Stroke::new(detail.width, color.gamma_multiply(0.45)),
+            );
+            let c = at(2.25, 2.25);
+            painter.circle_stroke(c, 3.5 * s, stroke);
             painter.circle_filled(c, 1.25 * s, color);
         }
         Icon::Grid => {
             let r = Rect::from_center_size(c, vec2(12.0, 12.0) * s);
-            painter.rect_stroke(r, 1.5, stroke, egui::StrokeKind::Middle);
+            painter.rect_stroke(r, 1.5 * s, stroke, egui::StrokeKind::Middle);
             for t in [1.0 / 3.0, 2.0 / 3.0] {
-                painter.vline(
-                    r.min.x + r.width() * t,
-                    r.y_range(),
-                    Stroke::new(1.0, color),
-                );
-                painter.hline(
-                    r.x_range(),
-                    r.min.y + r.height() * t,
-                    Stroke::new(1.0, color),
-                );
+                painter.vline(r.min.x + r.width() * t, r.y_range(), detail);
+                painter.hline(r.x_range(), r.min.y + r.height() * t, detail);
             }
         }
         Icon::Known => {
-            // A tilted orbit with an asteroid on it, around a small sun.
+            // An open tilted orbit with one asteroid in the gap: a closed
+            // ellipse with a sun inside it reads as a blob at toolbar size.
             let (cos, sin) = ((-0.45f32).cos(), (-0.45f32).sin());
             let orbit = |t: f32| {
-                let (x, y) = (7.0 * t.cos(), 4.25 * t.sin());
+                let (x, y) = (6.25 * t.cos(), 3.75 * t.sin());
                 at(x * cos - y * sin, x * sin + y * cos)
             };
-            let ring: Vec<Pos2> = (0..=40).map(|i| orbit(i as f32 / 40.0 * TAU)).collect();
-            painter.add(Shape::line(ring, Stroke::new(1.25, color)));
-            painter.circle_filled(c, 1.5 * s, color);
-            painter.circle_filled(orbit(0.9), 2.75 * s, color);
+            let (from, sweep) = (0.55, TAU - 1.7);
+            let arc: Vec<Pos2> = (0..=40)
+                .map(|i| orbit(from + i as f32 / 40.0 * sweep))
+                .collect();
+            painter.add(Shape::line(arc, stroke));
+            painter.circle_filled(orbit(from + sweep + 0.85), 2.0 * s, color);
         }
         Icon::Sidebar => {
-            let r = Rect::from_center_size(c, vec2(14.0, 12.0) * s);
-            let side = Rect::from_min_max(egui::pos2(r.max.x - 5.0 * s, r.min.y), r.max);
-            painter.rect_filled(side, 1.5, color.gamma_multiply(0.45));
-            painter.rect_stroke(r, 2.0, stroke, egui::StrokeKind::Middle);
-            painter.vline(side.min.x, r.y_range(), stroke);
+            let r = Rect::from_center_size(c, vec2(12.5, 11.0) * s);
+            let side = Rect::from_min_max(egui::pos2(r.max.x - 4.5 * s, r.min.y), r.max);
+            painter.rect_filled(side, 1.5 * s, color.gamma_multiply(0.45));
+            painter.rect_stroke(r, 2.0 * s, stroke, egui::StrokeKind::Middle);
+            painter.vline(side.min.x, r.y_range(), detail);
         }
         Icon::Gear => {
-            let teeth = 8;
-            for i in 0..teeth {
-                let a = i as f32 / teeth as f32 * TAU;
+            // Six teeth on one ring: the lightest form that still reads as a
+            // gear, so it no longer outweighs the rest of the toolbar.
+            let r = 4.25 * s;
+            painter.circle_stroke(c, r, stroke);
+            for i in 0..6 {
+                let a = (i as f32 + 0.5) / 6.0 * TAU;
                 let d = vec2(a.cos(), a.sin());
-                painter.line_segment(
-                    [c + d * 4.5 * s, c + d * 7.0 * s],
-                    Stroke::new(2.25 * s.max(0.8), color),
-                );
+                painter.line_segment([c + d * r, c + d * 6.75 * s], stroke);
             }
-            painter.circle_stroke(c, 4.75 * s, Stroke::new(1.75, color));
-            painter.circle_stroke(c, 1.75 * s, Stroke::new(1.5, color));
         }
         Icon::Close => {
             let k = 4.0;
@@ -155,10 +156,7 @@ pub fn paint(painter: &egui::Painter, rect: Rect, icon: Icon, color: Color32) {
             for i in 0..8 {
                 let a = i as f32 / 8.0 * TAU;
                 let d = vec2(a.cos(), a.sin());
-                painter.line_segment(
-                    [c + d * 5.25 * s, c + d * 7.0 * s],
-                    Stroke::new(1.25, color),
-                );
+                painter.line_segment([c + d * 5.25 * s, c + d * 7.0 * s], detail);
             }
         }
         Icon::Eye => {
@@ -166,13 +164,13 @@ pub fn paint(painter: &egui::Painter, rect: Rect, icon: Icon, color: Color32) {
                 (0..=16)
                     .map(|i| {
                         let t = i as f32 / 16.0 * 2.0 - 1.0;
-                        at(t * 7.0, sign * 4.5 * (1.0 - t * t))
+                        at(t * 6.5, sign * 4.5 * (1.0 - t * t))
                     })
                     .collect()
             };
             painter.add(Shape::line(lid(1.0), stroke));
             painter.add(Shape::line(lid(-1.0), stroke));
-            painter.circle_filled(c, 2.25 * s, color);
+            painter.circle_filled(c, 2.0 * s, color);
         }
         Icon::Update => {
             // A circular arrow.
@@ -199,56 +197,45 @@ pub fn paint(painter: &egui::Painter, rect: Rect, icon: Icon, color: Color32) {
             ));
         }
         Icon::Keyboard => {
-            let r = Rect::from_center_size(c, vec2(15.0, 10.0) * s);
-            painter.rect_stroke(r, 2.0, stroke, egui::StrokeKind::Middle);
+            let r = Rect::from_center_size(c, vec2(12.5, 10.0) * s);
+            painter.rect_stroke(r, 2.0 * s, stroke, egui::StrokeKind::Middle);
             for row in [-2.0, 0.5] {
-                for col in [-4.5, -1.5, 1.5, 4.5] {
-                    painter.circle_filled(at(col, row), 0.9 * s, color);
+                for col in [-3.75, -1.25, 1.25, 3.75] {
+                    painter.circle_filled(at(col, row), 0.8 * s, color);
                 }
             }
-            painter.hline(
-                (c.x - 3.0 * s)..=(c.x + 3.0 * s),
-                c.y + 3.0 * s,
-                Stroke::new(1.25, color),
-            );
+            painter.hline((c.x - 3.0 * s)..=(c.x + 3.0 * s), c.y + 3.0 * s, detail);
         }
         Icon::Info => {
-            painter.circle_stroke(c, 6.5 * s, stroke);
+            painter.circle_stroke(c, 6.25 * s, stroke);
             painter.circle_filled(at(0.0, -3.0), 1.0 * s, color);
-            painter.vline(
-                c.x,
-                (c.y - 0.75 * s)..=(c.y + 3.75 * s),
-                Stroke::new(1.75, color),
-            );
+            painter.vline(c.x, (c.y - 0.75 * s)..=(c.y + 3.75 * s), stroke);
         }
         Icon::Search => {
             painter.circle_stroke(at(-1.25, -1.25), 4.25 * s, stroke);
-            painter.line_segment([at(1.9, 1.9), at(5.5, 5.5)], Stroke::new(1.75, color));
+            painter.line_segment([at(1.9, 1.9), at(5.5, 5.5)], stroke);
         }
         Icon::History => {
             // A clock face.
-            painter.circle_stroke(c, 6.5 * s, stroke);
-            painter.line(
-                vec![at(0.0, -3.75), at(0.0, 0.0), at(2.75, 1.75)],
-                Stroke::new(1.5, color),
-            );
+            painter.circle_stroke(c, 6.25 * s, stroke);
+            painter.line(vec![at(0.0, -3.75), at(0.0, 0.0), at(2.75, 1.75)], detail);
         }
         Icon::Team => {
             // Two people, the one behind slightly smaller.
-            painter.circle_stroke(at(3.0, -3.25), 2.0 * s, Stroke::new(1.25, color));
+            painter.circle_stroke(at(4.25, -3.5), 1.75 * s, detail);
             painter.add(Shape::line(
-                vec![at(5.0, 1.0), at(6.5, 2.0), at(7.0, 4.5)],
-                Stroke::new(1.25, color),
+                vec![at(4.5, 1.0), at(5.75, 1.75), at(6.25, 4.0)],
+                detail,
             ));
-            painter.circle_stroke(at(-1.5, -2.5), 2.75 * s, stroke);
+            painter.circle_stroke(at(-1.75, -2.75), 2.5 * s, stroke);
             painter.add(Shape::line(
                 vec![
-                    at(-7.0, 6.0),
-                    at(-6.25, 2.75),
-                    at(-4.0, 1.25),
-                    at(1.0, 1.25),
-                    at(3.25, 2.75),
-                    at(4.0, 6.0),
+                    at(-6.25, 6.0),
+                    at(-5.5, 3.0),
+                    at(-3.75, 1.25),
+                    at(0.25, 1.25),
+                    at(2.0, 3.0),
+                    at(2.75, 6.0),
                 ],
                 stroke,
             ));
@@ -256,7 +243,7 @@ pub fn paint(painter: &egui::Painter, rect: Rect, icon: Icon, color: Color32) {
         Icon::Check => {
             painter.line(
                 vec![at(-4.5, 0.5), at(-1.25, 3.75), at(4.75, -3.75)],
-                Stroke::new(1.75, color),
+                stroke,
             );
         }
     }
@@ -280,7 +267,7 @@ pub fn button(ui: &mut egui::Ui, icon: Icon, selected: bool, enabled: bool) -> R
         } else if selected {
             p.accent
         } else {
-            p.text
+            p.icon
         };
         if selected {
             painter.rect_filled(rect, radius, p.accent_weak);

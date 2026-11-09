@@ -13,7 +13,7 @@ pub const MAX_IMAGES: usize = 4;
 const FITS_EXTENSIONS: [&str; 3] = ["fits", "fit", "fts"];
 pub const OPENABLE_EXTENSIONS: [&str; 4] = ["fits", "fit", "fts", "zip"];
 pub const NOT_OPENABLE: &str =
-    "Only FITS images (.fits, .fit, .fts) or a .zip of them can be opened.";
+    "Only FITS images (.fits, .fit, .fts), a folder of them, or a .zip of them can be opened.";
 
 /// A detected star, as much as the viewer needs. Positions are 0-based FITS
 /// pixels (y = 0 is the bottom row).
@@ -68,6 +68,37 @@ fn file_name(path: &str) -> String {
     Path::new(path)
         .file_name()
         .map_or_else(|| path.to_owned(), |n| n.to_string_lossy().into_owned())
+}
+
+/// Replaces every folder in `paths` with the FITS files directly inside it,
+/// sorted by name; other paths pass through. Not recursive: a set is one
+/// folder of 3–4 frames, and a deeper search would mix unrelated sets.
+pub fn expand_folders(paths: Vec<String>) -> Result<Vec<String>, String> {
+    let mut out = Vec::with_capacity(paths.len());
+    for path in paths {
+        if !Path::new(&path).is_dir() {
+            out.push(path);
+            continue;
+        }
+        // Absolute, so a folder given as `.` still names the set.
+        let dir = std::path::absolute(&path).unwrap_or_else(|_| path.clone().into());
+        let name = file_name(&dir.to_string_lossy());
+        let entries = std::fs::read_dir(&dir).map_err(|e| format!("{name}: {e}"))?;
+        let mut files: Vec<String> = entries
+            .flatten()
+            .map(|e| e.path().to_string_lossy().into_owned())
+            .filter(|p| has_extension(p, &FITS_EXTENSIONS))
+            .filter(|p| !file_name(p).starts_with("._") && Path::new(p).is_file())
+            .collect();
+        if files.is_empty() {
+            return Err(format!(
+                "No FITS images (.fits, .fit, .fts) in the folder {name}."
+            ));
+        }
+        files.sort();
+        out.append(&mut files);
+    }
+    Ok(out)
 }
 
 /// A FITS file to load: its display name and either a path or its bytes (from a zip).
@@ -363,6 +394,36 @@ mod tests {
             ..r
         };
         assert_eq!(cut(&gray, w, h, &corner), [0, 10, 11, 0, 0, 1, 0, 0, 0]);
+    }
+
+    #[test]
+    fn folders_expand_to_their_fits_files() {
+        let root = std::env::temp_dir().join(format!("oc-folder-{}", std::process::id()));
+        let dir = root.join("XY57_p01");
+        let empty = root.join("empty");
+        std::fs::create_dir_all(dir.join("deeper")).unwrap();
+        std::fs::create_dir_all(&empty).unwrap();
+        for name in ["b.FIT", "a.fits", "notes.txt", "._a.fits", "c.zip"] {
+            std::fs::write(dir.join(name), b"").unwrap();
+        }
+        std::fs::write(dir.join("deeper/d.fits"), b"").unwrap();
+        let text = |p: &std::path::Path| p.to_string_lossy().into_owned();
+
+        let got = expand_folders(vec![text(&dir), "/x/other.zip".into()]).unwrap();
+        assert_eq!(
+            got,
+            [
+                text(&dir.join("a.fits")),
+                text(&dir.join("b.FIT")),
+                "/x/other.zip".into()
+            ]
+        );
+        let err = expand_folders(vec![text(&empty)]).unwrap_err();
+        assert!(
+            err.contains("No FITS images") && err.contains("empty"),
+            "{err}"
+        );
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]

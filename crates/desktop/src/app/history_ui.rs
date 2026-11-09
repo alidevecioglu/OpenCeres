@@ -152,6 +152,7 @@ impl App {
                 self.grid_size = record.grid;
             }
             self.marks.clone_from(&record.boxes);
+            self.object_boxes.clone_from(&record.object_boxes);
             if !self.marks.is_empty() {
                 self.set_grid(true);
             }
@@ -176,9 +177,13 @@ impl App {
         h.saved = None;
         h.resumed = None;
         self.marks.clear();
+        self.object_boxes.clear();
         self.copied = false;
         self.objects.clear();
         self.marking = None;
+        self.editing = None;
+        self.undo = None;
+        self.grid_change = None;
     }
 
     /// Copying the report counts as reporting it.
@@ -196,6 +201,7 @@ impl App {
         let h = &mut self.searches;
         let Some(r) = &mut h.record else { return };
         r.boxes.clone_from(&self.marks);
+        r.object_boxes.clone_from(&self.object_boxes);
         r.objects.clone_from(&self.objects);
         r.grid = self.grid_size;
         if let Some(KnownState::Done(k)) = &self.known {
@@ -244,7 +250,11 @@ impl App {
         let h = &mut self.searches;
         let Some(r) = &mut h.record else { return };
         ui.horizontal(|ui| {
-            ui.label(RichText::new("Your search").strong().color(p.text));
+            ui.label(
+                RichText::new("Your search")
+                    .family(theme::semibold())
+                    .color(p.text),
+            );
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 if let Some(e) = &h.error {
                     ui.label(RichText::new("Not saved").small().color(p.danger))
@@ -869,7 +879,7 @@ fn row_header(ui: &mut egui::Ui, r: &Record, expanded: bool, current: bool) -> R
         s @ (Status::Reported | Status::Searching) => (s.label().to_owned(), p.text),
         s => (s.label().to_owned(), p.muted),
     };
-    let pill = painter.layout_no_wrap(pill_text, FontId::proportional(11.5), pill_color);
+    let pill = painter.layout_no_wrap(pill_text, FontId::proportional(12.0), pill_color);
     let pill_size = pill.size() + vec2(2.0 * S2, 6.0);
     let pill_rect = egui::Rect::from_min_size(
         pos2(
@@ -951,7 +961,7 @@ pub fn folder_setting(app: &mut App, ui: &mut egui::Ui) {
         Label::new(
             RichText::new(dir.display().to_string())
                 .monospace()
-                .size(11.5)
+                .size(12.0)
                 .color(p.text),
         )
         .wrap()

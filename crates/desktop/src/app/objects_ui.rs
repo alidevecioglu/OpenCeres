@@ -37,8 +37,48 @@ pub(super) struct Review {
     pub record: Record,
     /// Positions moved onto the open set's frames.
     pub objects: Vec<Tagged>,
-    pub color: Color32,
+    /// Lowest free turn among the reviews shown, keeping colour and ring
+    /// pattern the same while others are added and removed.
+    pub slot: usize,
     pub shown: bool,
+}
+
+/// A report box as (row, column).
+type Cell = (usize, usize);
+
+/// What the last deletion took away, kept until putting it back no longer
+/// makes sense (see where `App::undo` is reset).
+pub(super) enum Undo {
+    Object {
+        index: usize,
+        object: Tagged,
+        /// Its box went with it.
+        removed_box: bool,
+    },
+    /// Everything `Clear` removed.
+    Boxes {
+        marks: Vec<Cell>,
+        object_boxes: Vec<Cell>,
+    },
+}
+
+/// How the last mark was placed, shown because snapping and moving on to
+/// the next frame otherwise leave no trace of which one happened.
+#[derive(Clone, Copy)]
+pub(super) enum Snap {
+    Source,
+    Clicked,
+    Predicted,
+}
+
+impl Snap {
+    fn text(self) -> &'static str {
+        match self {
+            Snap::Source => "Snapped to a detected source",
+            Snap::Clicked => "No source nearby: placed where you clicked. Zoom in for accuracy.",
+            Snap::Predicted => "No source nearby: placed at the predicted spot.",
+        }
+    }
 }
 
 /// An export with cutouts being written in the background.
@@ -67,11 +107,13 @@ impl App {
         let map = history::frame_map(&record.frames, &ours);
         let objects = history::remap(&record.objects, &map, ours.len());
         self.reviews.retain(|r| r.record.id != record.id);
-        let color = theme::REVIEW[self.reviews.len() % theme::REVIEW.len()];
+        let slot = (0..)
+            .find(|s| self.reviews.iter().all(|r| r.slot != *s))
+            .unwrap_or(0);
         self.reviews.push(Review {
             record,
             objects,
-            color,
+            slot,
             shown: true,
         });
     }
@@ -93,16 +135,49 @@ impl App {
             at: vec![None; n],
             ..Tagged::default()
         });
+        // The new object may take a deleted object's label.
+        self.undo = None;
+        self.snap = None;
         self.marking = Some(self.objects.len() - 1);
         self.playing = false;
         self.index = 0;
         self.prefs.panel_open = true;
     }
 
+    /// Re-enters the marking flow for finished object `i`, keeping a copy
+    /// so the edit can be cancelled.
+    pub(super) fn edit_object(&mut self, i: usize) {
+        if self.marking.is_some() {
+            return;
+        }
+        let Some(o) = self.objects.get(i) else { return };
+        self.editing = Some(o.clone());
+        self.marking = Some(i);
+        self.snap = None;
+        self.report_note = None;
+        self.playing = false;
+        self.index = 0;
+        self.prefs.panel_open = true;
+    }
+
+    /// Discards the edit in progress, putting the object back as it was.
+    pub(super) fn cancel_edit(&mut self) {
+        if let (Some(m), Some(original)) = (self.marking.take(), self.editing.take())
+            && let Some(o) = self.objects.get_mut(m)
+        {
+            *o = original;
+        }
+        self.snap = None;
+    }
+
     /// The student clicked at view pixel `(x, y)` while marking: put the
     /// object there on this frame (on the nearest detected source if one
     /// is close) and go on to the next frame still to mark.
     pub(super) fn place_mark(&mut self, x: f64, y: f64) {
+        self.place_at(x, y, Snap::Clicked);
+    }
+
+    fn place_at(&mut self, x: f64, y: f64, unsnapped: Snap) {
         let Some(m) = self.marking else { return };
         let i = self.index;
         let (fx, fy) = self
@@ -117,6 +192,11 @@ impl App {
                 .filter(|s| s.2 <= SNAP_PIXELS)
                 .min_by(|a, b| a.2.total_cmp(&b.2))
         });
+        self.snap = Some(if snapped.is_some() {
+            Snap::Source
+        } else {
+            unsnapped
+        });
         let at = snapped.map_or((fx, fy), |(sx, sy, _)| (sx, sy));
         if let Some(o) = self.objects.get_mut(m)
             && let Some(slot) = o.at.get_mut(i)
@@ -129,51 +209,157 @@ impl App {
     /// Uses the predicted position on this frame (Enter).
     pub(super) fn accept_prediction(&mut self) {
         if let Some((x, y)) = self.prediction() {
-            self.place_mark(x, y);
+            self.place_at(x, y, Snap::Predicted);
         }
     }
 
-    /// Goes to the next frame without a mark, or finishes.
+    /// "Not on this frame": removes any mark here and moves on.
+    pub(super) fn skip_frame(&mut self) {
+        if let Some(slot) = self
+            .marking
+            .and_then(|m| self.objects.get_mut(m))
+            .and_then(|o| o.at.get_mut(self.index))
+        {
+            *slot = None;
+        }
+        self.snap = None;
+        self.next_unmarked();
+    }
+
+    /// Goes to the next frame still to mark (when editing, simply the next
+    /// frame: all of them are marked), or finishes.
     pub(super) fn next_unmarked(&mut self) {
         let Some(o) = self.marking.and_then(|m| self.objects.get(m)) else {
             return;
         };
-        match (self.index + 1..o.at.len()).find(|&j| o.at[j].is_none()) {
+        let editing = self.editing.is_some();
+        match (self.index + 1..o.at.len()).find(|&j| editing || o.at[j].is_none()) {
             Some(j) => self.index = j,
             None => self.finish_marking(),
         }
     }
 
     /// Ends marking. An object marked on fewer than two frames says
-    /// nothing about motion and is dropped.
+    /// nothing about motion and is dropped; an edit that left it so is
+    /// undone instead, since the object was fine before.
     pub(super) fn finish_marking(&mut self) {
         let Some(m) = self.marking.take() else { return };
+        let original = self.editing.take();
+        let snap = self.snap.take();
         let Some(o) = self.objects.get(m) else { return };
         if o.marked() < 2 {
-            self.objects.remove(m);
-            self.report_note = Some("An object needs a mark on at least two frames.".into());
+            let note = "An object needs a mark on at least two frames.";
+            self.report_note = Some(match original {
+                Some(original) => {
+                    self.objects[m] = original;
+                    format!("{note} It keeps its earlier marks.")
+                }
+                None => {
+                    self.objects.remove(m);
+                    note.to_owned()
+                }
+            });
             return;
         }
-        self.report_note = None;
+        self.report_note = snap.map(|s| s.text().to_owned());
         let mut o = o.clone();
         self.derive(&mut o);
         if let Some(cell) = o.cell
-            && !self.marks.contains(&cell)
+            && claim_box(&mut self.marks, &mut self.object_boxes, cell)
         {
-            self.marks.push(cell);
             self.copied = false;
         }
+        let new_cell = o.cell;
         self.objects[m] = o;
+        // An edit can move an object out of the box that was marked for it.
+        if let Some(old) = original.and_then(|o| o.cell)
+            && Some(old) != new_cell
+            && release_box(&mut self.marks, &mut self.object_boxes, old, &self.objects)
+        {
+            self.copied = false;
+        }
     }
 
     pub(super) fn delete_object(&mut self, i: usize) {
-        if i < self.objects.len() {
-            self.objects.remove(i);
-            self.marking = match self.marking {
-                Some(m) if m == i => None,
-                Some(m) if m > i => Some(m - 1),
-                m => m,
-            };
+        if i >= self.objects.len() {
+            return;
+        }
+        let object = self.objects.remove(i);
+        self.marking = match self.marking {
+            Some(m) if m == i => None,
+            Some(m) if m > i => Some(m - 1),
+            m => m,
+        };
+        let removed_box = object.cell.is_some_and(|c| {
+            release_box(&mut self.marks, &mut self.object_boxes, c, &self.objects)
+        });
+        self.copied &= !removed_box;
+        self.undo = Some(Undo::Object {
+            index: i,
+            object,
+            removed_box,
+        });
+    }
+
+    /// Clear: forgets every marked box, until Undo.
+    pub(super) fn clear_boxes(&mut self) {
+        self.undo = Some(Undo::Boxes {
+            marks: std::mem::take(&mut self.marks),
+            object_boxes: std::mem::take(&mut self.object_boxes),
+        });
+        self.copied = false;
+    }
+
+    /// Puts back what the last deletion removed.
+    pub(super) fn apply_undo(&mut self) {
+        match self.undo.take() {
+            None => {}
+            Some(Undo::Object {
+                index,
+                object,
+                removed_box,
+            }) => {
+                let index = index.min(self.objects.len());
+                if removed_box && let Some(cell) = object.cell {
+                    claim_box(&mut self.marks, &mut self.object_boxes, cell);
+                    self.copied = false;
+                }
+                self.objects.insert(index, object);
+                self.marking = self.marking.map(|m| if m >= index { m + 1 } else { m });
+            }
+            Some(Undo::Boxes {
+                marks,
+                object_boxes,
+            }) => {
+                restore_boxes(
+                    &mut self.marks,
+                    &mut self.object_boxes,
+                    &marks,
+                    &object_boxes,
+                );
+                self.copied = false;
+            }
+        }
+    }
+
+    /// The report box of an object: where its first mark falls on the grid.
+    fn object_cell(&self, o: &Tagged) -> Option<Cell> {
+        let (i, (x, y)) =
+            o.at.iter()
+                .enumerate()
+                .find_map(|(i, p)| Some((i, (*p)?)))?;
+        let (x, y) = self.placement(i).apply(x, y);
+        let (w, h) = self.view_size()?;
+        let u = (x as f32 + 0.5) / w;
+        let v = (h - 0.5 - y as f32) / h;
+        Some(super::grid_box(u, v, self.grid_size))
+    }
+
+    /// Objects' boxes on the current grid, after its size changed.
+    pub(super) fn rederive_cells(&mut self) {
+        let cells: Vec<Option<Cell>> = self.objects.iter().map(|o| self.object_cell(o)).collect();
+        for (o, cell) in self.objects.iter_mut().zip(cells) {
+            o.cell = cell;
         }
     }
 
@@ -185,13 +371,7 @@ impl App {
                 .enumerate()
                 .filter_map(|(i, p)| Some((i, (*p)?)))
                 .collect();
-        o.cell = marked.first().and_then(|&(i, (x, y))| {
-            let (x, y) = self.placement(i).apply(x, y);
-            let (w, h) = self.view_size()?;
-            let u = (x as f32 + 0.5) / w;
-            let v = (h - 0.5 - y as f32) / h;
-            Some(super::grid_box(u, v, self.grid_size))
-        });
+        o.cell = self.object_cell(o);
 
         // Motion from the first to the last mark, each through its own
         // frame's WCS (their errors largely cancel over so short a track).
@@ -290,7 +470,14 @@ impl App {
         };
         // Labels already drawn, so one on the same object goes below it.
         let taken = std::cell::RefCell::new(Vec::<Rect>::new());
-        let draw = |o: &Tagged, color: Color32, name: Option<&str>, active: bool| {
+        let ov = theme::overlay(self.invert);
+        let halo = ov.halo;
+        let draw = |o: &Tagged,
+                    color: Color32,
+                    chip_color: Color32,
+                    who: Option<&str>,
+                    pattern: RingPattern,
+                    active: bool| {
             let points: Vec<(usize, Pos2)> =
                 o.at.iter()
                     .enumerate()
@@ -299,12 +486,20 @@ impl App {
             let r = (3.0 * scale).max(9.0);
             for pair in points.windows(2) {
                 if let Some(segment) = between_rings(pair[0].1, pair[1].1, r) {
-                    painter.line_segment(segment, Stroke::new(1.0, color.gamma_multiply(0.6)));
+                    painter.line_segment(segment, Stroke::new(1.0, color.gamma_multiply(ov.track)));
                 }
             }
             for &(i, c) in &points {
                 if i != self.index {
-                    painter.circle_stroke(c, r, Stroke::new(1.0, color.gamma_multiply(0.8)));
+                    ring(
+                        painter,
+                        c,
+                        r,
+                        1.0,
+                        color.gamma_multiply(ov.past),
+                        halo,
+                        pattern,
+                    );
                 }
             }
             let Some(&(_, c)) = points.iter().find(|p| p.0 == self.index) else {
@@ -314,13 +509,12 @@ impl App {
                 return;
             }
             let width = if active { 2.25 } else { 1.75 };
-            painter.circle_stroke(c, r, Stroke::new(width + 2.0, theme::KNOWN_HALO));
-            painter.circle_stroke(c, r, Stroke::new(width, color));
-            let text = match name {
-                Some(n) => format!("{} · {n}", o.label),
+            ring(painter, c, r, width, color, halo, pattern);
+            let text = match who {
+                Some(w) => format!("{} · {w}", o.label),
                 None => o.label.clone(),
             };
-            let galley = painter.layout_no_wrap(text, FontId::proportional(11.5), color);
+            let galley = painter.layout_no_wrap(text, FontId::proportional(12.0), chip_color);
             let d = r * std::f32::consts::FRAC_1_SQRT_2;
             let mut chip = Rect::from_min_size(
                 c + vec2(-d - 4.0 - galley.size().x - S2, -d - 15.0),
@@ -331,32 +525,35 @@ impl App {
                 chip = chip.translate(vec2(0.0, 19.0));
             }
             taken.push(chip);
-            painter.rect_filled(chip, 3.0, theme::GRID_CHIP);
+            painter.rect_filled(chip, 3.0, ov.chip);
             painter.galley(
                 pos2(chip.min.x + S1, chip.center().y - galley.size().y / 2.0),
                 galley,
-                color,
+                chip_color,
             );
         };
         for review in self.reviews.iter().filter(|r| r.shown) {
-            let name = review.record.searched_by.trim();
-            let name = if name.is_empty() { "?" } else { name };
+            let who = review_initial(review.record.searched_by.trim(), review.slot);
+            let color = ov.review[review.slot % ov.review.len()];
+            let pattern = RingPattern::for_slot(review.slot);
             for o in &review.objects {
-                draw(o, review.color, Some(name), false);
+                draw(o, color, color, Some(&who), pattern, false);
             }
         }
         for (i, o) in self.objects.iter().enumerate() {
-            draw(o, theme::TAG, None, Some(i) == self.marking);
+            draw(
+                o,
+                ov.tag,
+                ov.tag_text,
+                None,
+                RingPattern::Solid,
+                Some(i) == self.marking,
+            );
         }
         if let Some((x, y)) = self.prediction() {
             let c = origin + vec2(x as f32 + 0.5, h - 0.5 - y as f32) * scale;
             let r = (3.0 * scale).max(9.0);
-            let n = 16;
-            for k in (0..n).step_by(2) {
-                let a = |j: usize| j as f32 / n as f32 * std::f32::consts::TAU;
-                let p = |j: usize| c + vec2(a(j).cos(), a(j).sin()) * r;
-                painter.line_segment([p(k), p(k + 1)], Stroke::new(1.5, theme::TAG));
-            }
+            ring(painter, c, r, 1.5, ov.tag, halo, RingPattern::Dashed);
         }
     }
 
@@ -365,8 +562,13 @@ impl App {
         let Some(o) = self.marking.and_then(|m| self.objects.get(m)) else {
             return;
         };
+        let verb = if self.editing.is_some() {
+            "Click the new position of"
+        } else {
+            "Click"
+        };
         let mut text = format!(
-            "Click {} on frame {} of {}",
+            "{verb} {} on frame {} of {}",
             o.label,
             self.index + 1,
             o.at.len()
@@ -376,7 +578,7 @@ impl App {
         }
         text += "  ·  Esc: done";
         let painter = ui.painter_at(rect);
-        let galley = painter.layout_no_wrap(text, FontId::proportional(12.5), theme::OVERLAY_TEXT);
+        let galley = painter.layout_no_wrap(text, FontId::proportional(13.0), theme::OVERLAY_TEXT);
         let size = galley.size() + vec2(2.0 * S3, 2.0 * S1 + 2.0);
         let chip =
             Rect::from_center_size(pos2(rect.center().x, rect.min.y + S3 + size.y / 2.0), size);
@@ -384,10 +586,22 @@ impl App {
         painter.rect_stroke(
             chip,
             theme::RADIUS,
-            Stroke::new(1.0, theme::TAG),
+            Stroke::new(1.0, theme::OVERLAY.tag),
             egui::StrokeKind::Inside,
         );
         painter.galley(chip.min + vec2(S3, S1 + 1.0), galley, theme::OVERLAY_TEXT);
+        if let Some(snap) = self.snap {
+            let galley = painter.layout_no_wrap(
+                snap.text().to_owned(),
+                FontId::proportional(12.0),
+                theme::OVERLAY_TEXT,
+            );
+            let size = galley.size() + vec2(2.0 * S3, 2.0 * S1 + 2.0);
+            let below =
+                Rect::from_center_size(pos2(rect.center().x, chip.max.y + S1 + size.y / 2.0), size);
+            painter.rect_filled(below, theme::RADIUS, theme::BADGE);
+            painter.galley(below.min + vec2(S3, S1 + 1.0), galley, theme::OVERLAY_TEXT);
+        }
     }
 
     /// Centres the view on where object `o` is on this frame (or its first mark).
@@ -423,33 +637,44 @@ impl App {
         }
         if let Some(o) = self.marking.and_then(|m| self.objects.get(m)) {
             let (label, done) = (o.label.clone(), o.marked());
+            let editing = self.editing.is_some();
             Frame::new()
                 .fill(p.inset)
                 .corner_radius(theme::RADIUS)
-                .stroke(Stroke::new(1.0, theme::TAG))
+                .stroke(Stroke::new(1.0, p.tag))
                 .inner_margin(Margin::same(S2 as i8))
                 .show(ui, |ui| {
                     ui.set_width(ui.available_width());
+                    let (doing, more) = if editing {
+                        (
+                            "Editing",
+                            "A click moves it on this frame and goes to the next. Marks \
+                             you don't change stay. ← → choose another frame.",
+                        )
+                    } else {
+                        (
+                            "Marking",
+                            "Clicks snap to the centre of a detected source nearby. \
+                             ← → choose another frame.",
+                        )
+                    };
                     ui.label(
                         RichText::new(format!(
-                            "Marking {label}: click it on frame {} of {}.",
+                            "{doing} {label}: click it on frame {} of {}.",
                             self.index + 1,
                             self.frame_count()
                         ))
                         .color(p.text),
                     );
-                    muted_wrapped(
-                        ui,
-                        "Clicks snap to the centre of a detected source nearby. \
-                         ← → choose another frame.",
-                    );
-                    ui.horizontal(|ui| {
+                    muted_wrapped(ui, more);
+                    // Wraps: the three buttons don't fit the panel side by side.
+                    ui.horizontal_wrapped(|ui| {
                         if ui
                             .button("Not on this frame")
                             .on_hover_text("Too faint, hidden or off the image here")
                             .clicked()
                         {
-                            self.next_unmarked();
+                            self.skip_frame();
                         }
                         let finish = ui
                             .add_enabled(done >= 2, Button::new("Done"))
@@ -458,7 +683,15 @@ impl App {
                         if finish.clicked() {
                             self.finish_marking();
                         }
-                        if done < 2 && ui.button("Cancel").clicked() {
+                        if editing {
+                            if ui
+                                .button("Cancel")
+                                .on_hover_text("Keep the marks as they were")
+                                .clicked()
+                            {
+                                self.cancel_edit();
+                            }
+                        } else if done < 2 && ui.button("Cancel").clicked() {
                             self.finish_marking();
                         }
                     });
@@ -473,6 +706,7 @@ impl App {
 
         let mut delete = None;
         let mut focus = None;
+        let mut edit = None;
         for (i, o) in self.objects.iter().enumerate() {
             if Some(i) == self.marking {
                 continue;
@@ -483,7 +717,7 @@ impl App {
                     .collect();
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = S1;
-                let text = RichText::new(o.summary()).color(theme::TAG);
+                let text = RichText::new(o.summary()).color(p.tag);
                 if ui
                     .add(Label::new(text).sense(egui::Sense::click()))
                     .on_hover_text("Show it")
@@ -503,13 +737,23 @@ impl App {
                         .on_hover_text("Frames it is marked on");
                 });
             });
-            if let Some(k) = &o.known {
-                ui.label(
-                    RichText::new(format!("Known: {k}"))
-                        .small()
-                        .color(theme::KNOWN_TEXT),
-                );
-            }
+            ui.horizontal(|ui| {
+                if let Some(k) = &o.known {
+                    ui.label(RichText::new(format!("Known: {k}")).small().color(p.known));
+                }
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if ui
+                        .add_enabled(
+                            self.marking.is_none(),
+                            egui::Link::new(RichText::new("Edit marks").small().color(p.accent)),
+                        )
+                        .on_hover_text("Move or remove its marks, frame by frame")
+                        .clicked()
+                    {
+                        edit = Some(i);
+                    }
+                });
+            });
         }
         if let Some(i) = focus {
             let o = self.objects[i].clone();
@@ -517,6 +761,16 @@ impl App {
         }
         if let Some(i) = delete {
             self.delete_object(i);
+        }
+        if let Some(i) = edit {
+            self.edit_object(i);
+        }
+        let undo = match &self.undo {
+            Some(Undo::Object { object, .. }) => Some(format!("Deleted {}", object.label)),
+            _ => None,
+        };
+        if undo.is_some_and(|text| super::undo_row(ui, &text)) {
+            self.apply_undo();
         }
 
         let can_export = !self.objects.is_empty()
@@ -590,7 +844,21 @@ impl App {
             let name = if name.is_empty() { "Unnamed" } else { name };
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = S1;
-                ui.checkbox(&mut r.shown, RichText::new(name).color(r.color))
+                // The ring, in the panel's own contrast, is the key to the
+                // image: its pattern and the initial on the chip match.
+                let key_size = vec2(16.0, ui.spacing().interact_size.y);
+                let (key, _) = ui.allocate_exact_size(key_size, egui::Sense::hover());
+                let colors = theme::overlay(!ui.visuals().dark_mode);
+                ring(
+                    ui.painter(),
+                    key.center(),
+                    6.0,
+                    1.5,
+                    colors.review[r.slot % colors.review.len()],
+                    Color32::TRANSPARENT,
+                    RingPattern::for_slot(r.slot),
+                );
+                ui.checkbox(&mut r.shown, RichText::new(name).color(p.text))
                     .on_hover_text("Show their objects on the images");
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     if ui
@@ -695,6 +963,7 @@ impl App {
         let mut record = self.searches.record.clone()?;
         record.objects.clone_from(&self.objects);
         record.boxes.clone_from(&self.marks);
+        record.object_boxes.clone_from(&self.object_boxes);
         Some(record)
     }
 
@@ -828,6 +1097,52 @@ impl App {
     }
 }
 
+/// Records that the report needs box `cell` for an object. Only a box this
+/// adds counts as the objects': one the student clicked was theirs first.
+/// Returns whether it was added.
+fn claim_box(marks: &mut Vec<Cell>, object_boxes: &mut Vec<Cell>, cell: Cell) -> bool {
+    if marks.contains(&cell) {
+        return false;
+    }
+    marks.push(cell);
+    object_boxes.push(cell);
+    true
+}
+
+/// Removes box `cell` if only objects put it there and none of `objects`
+/// (those remaining) is still in it. Returns whether it went.
+fn release_box(
+    marks: &mut Vec<Cell>,
+    object_boxes: &mut Vec<Cell>,
+    cell: Cell,
+    objects: &[Tagged],
+) -> bool {
+    if !object_boxes.contains(&cell) || objects.iter().any(|o| o.cell == Some(cell)) {
+        return false;
+    }
+    object_boxes.retain(|&b| b != cell);
+    marks.retain(|&b| b != cell);
+    true
+}
+
+/// Undo of Clear: boxes the student has marked since stay as they are, so
+/// a box they re-marked by hand counts as theirs from now on.
+fn restore_boxes(
+    marks: &mut Vec<Cell>,
+    object_boxes: &mut Vec<Cell>,
+    old_marks: &[Cell],
+    old_object_boxes: &[Cell],
+) {
+    for &cell in old_marks {
+        if !marks.contains(&cell) {
+            marks.push(cell);
+            if old_object_boxes.contains(&cell) {
+                object_boxes.push(cell);
+            }
+        }
+    }
+}
+
 /// One cutout per marked position, all of an object's centred on the same
 /// patch of sky (the middle of its track on the first frame's grid) so the
 /// stars stand still and the object moves, as in the blink. Returns the
@@ -887,6 +1202,85 @@ fn cutout_requests(
 /// The part of the track from `a` to `b` outside the rings of radius `r`
 /// around them, so the line never covers the object inside a ring. `None`
 /// when the rings touch and no line is left to draw.
+/// How a report's rings are drawn, so reports are told apart without hue.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub(super) enum RingPattern {
+    Solid,
+    Dashed,
+    Dotted,
+}
+
+impl RingPattern {
+    /// Dashed and dotted first: the student's own marks are the solid ones.
+    fn for_slot(slot: usize) -> RingPattern {
+        [RingPattern::Dashed, RingPattern::Dotted, RingPattern::Solid][slot % 3]
+    }
+}
+
+/// A hollow ring (marks must not cover the object inside) in `pattern`,
+/// over a halo of the opposite lightness that follows the same dashes so it
+/// does not fill the gaps.
+fn ring(
+    painter: &egui::Painter,
+    c: Pos2,
+    r: f32,
+    width: f32,
+    color: Color32,
+    halo: Color32,
+    pattern: RingPattern,
+) {
+    use std::f32::consts::TAU;
+    let at = |t: f32| c + vec2(t.cos(), t.sin()) * r;
+    match pattern {
+        RingPattern::Solid => {
+            painter.circle_stroke(c, r, Stroke::new(width + 2.0, halo));
+            painter.circle_stroke(c, r, Stroke::new(width, color));
+        }
+        RingPattern::Dashed => {
+            let dashes = ((TAU * r / 10.0).round() as usize).max(4);
+            let step = TAU / (2 * dashes) as f32;
+            for layer in [Stroke::new(width + 2.0, halo), Stroke::new(width, color)] {
+                for k in 0..dashes {
+                    let start = k as f32 * 2.0 * step;
+                    let points = (0..=4)
+                        .map(|j| at(start + step * j as f32 / 4.0))
+                        .collect::<Vec<_>>();
+                    painter.add(egui::Shape::line(points, layer));
+                }
+            }
+        }
+        RingPattern::Dotted => {
+            let dots = ((TAU * r / 6.0).round() as usize).max(8);
+            let radius = (width * 0.8).max(1.0);
+            for k in 0..dots {
+                let p = at(k as f32 / dots as f32 * TAU);
+                painter.circle_filled(p, radius + 1.0, halo);
+                painter.circle_filled(p, radius, color);
+            }
+        }
+    }
+}
+
+/// What a report's chips say instead of the name, which rarely fits on the
+/// image: the student's initial, or their turn if the fonts lack it (so it
+/// stays readable for a name in a script the app has no glyphs for).
+fn review_initial(name: &str, slot: usize) -> String {
+    name.chars()
+        .next()
+        .map(turkish_upper)
+        .filter(|&c| theme::can_draw(c))
+        .map_or_else(|| (slot + 1).to_string(), |c| c.to_string())
+}
+
+/// Upper case with the dotted and dotless i of Turkish names kept apart.
+fn turkish_upper(c: char) -> char {
+    match c {
+        'i' => '\u{130}',
+        'ı' => 'I',
+        c => c.to_uppercase().next().unwrap_or(c),
+    }
+}
+
 fn between_rings(a: Pos2, b: Pos2, r: f32) -> Option<[Pos2; 2]> {
     let delta = b - a;
     let length = delta.length();
@@ -933,6 +1327,20 @@ mod tests {
     use super::*;
 
     #[test]
+    fn initial_is_uppercased_the_turkish_way() {
+        assert_eq!(turkish_upper('i'), '\u{130}');
+        assert_eq!(turkish_upper('ş'), 'Ş');
+        assert_eq!(turkish_upper('a'), 'A');
+    }
+
+    #[test]
+    fn reviews_cycle_patterns_and_never_start_solid() {
+        assert_eq!(RingPattern::for_slot(0), RingPattern::Dashed);
+        assert_ne!(RingPattern::for_slot(0), RingPattern::for_slot(1));
+        assert_eq!(RingPattern::for_slot(2), RingPattern::Solid);
+    }
+
+    #[test]
     fn separation_and_position_angle() {
         // 10″ due north, then due east (at Dec 0), then south-west.
         let s = 10.0 / 3600.0;
@@ -942,6 +1350,43 @@ mod tests {
         assert!((pa - 90.0).abs() < 1e-6);
         let (_, pa) = separation_and_angle(20.0, 4.0, 20.0 - s, 4.0 - s);
         assert!((pa - 225.0).abs() < 0.1, "{pa}");
+    }
+
+    fn object(label: &str, cell: Option<Cell>) -> Tagged {
+        Tagged {
+            label: label.into(),
+            cell,
+            ..Tagged::default()
+        }
+    }
+
+    #[test]
+    fn deleting_an_object_removes_only_its_own_box() {
+        let (mut marks, mut auto) = (vec![(1, 1)], Vec::new()); // 1x1 by hand
+        assert!(claim_box(&mut marks, &mut auto, (2, 2)));
+        assert!(!claim_box(&mut marks, &mut auto, (1, 1)), "already marked");
+        assert_eq!(auto, [(2, 2)]);
+
+        // A box the student clicked stays, even with no object left in it.
+        assert!(!release_box(&mut marks, &mut auto, (1, 1), &[]));
+        assert_eq!(marks, [(1, 1), (2, 2)]);
+        // An object's box stays while another object is in it...
+        let other = [object("B", Some((2, 2)))];
+        assert!(!release_box(&mut marks, &mut auto, (2, 2), &other));
+        assert_eq!(marks, [(1, 1), (2, 2)]);
+        // ...and goes with the last one, whichever object added it.
+        assert!(release_box(&mut marks, &mut auto, (2, 2), &[]));
+        assert_eq!(marks, [(1, 1)]);
+        assert!(auto.is_empty());
+    }
+
+    #[test]
+    fn undoing_clear_keeps_boxes_marked_since() {
+        let (mut marks, mut auto) = (vec![(3, 3), (1, 1)], Vec::new());
+        restore_boxes(&mut marks, &mut auto, &[(1, 1), (2, 2)], &[(1, 1), (2, 2)]);
+        assert_eq!(marks, [(3, 3), (1, 1), (2, 2)]);
+        // (1, 1) was marked by hand after the Clear, so it is the student's.
+        assert_eq!(auto, [(2, 2)]);
     }
 
     #[test]

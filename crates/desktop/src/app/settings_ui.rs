@@ -27,6 +27,8 @@ const REPO: &str = "https://github.com/alidevecioglu/OpenCeres";
 impl App {
     pub(super) fn settings_window(&mut self, ctx: &egui::Context, now: f64) {
         if !self.settings_open {
+            // A question from Settings closes with it, and no change was made.
+            self.grid_change = self.grid_change.filter(|c| !c.from_settings);
             return;
         }
         let before = self.prefs;
@@ -121,6 +123,7 @@ impl App {
                             .show(ui, |ui| {
                                 ui.set_width(ui.available_width());
                                 ui.spacing_mut().item_spacing.y = S1;
+                                self.grid_change_row(ui);
                                 if self.settings_search.trim().is_empty() {
                                     self.settings_page_content(ui);
                                 } else {
@@ -207,8 +210,12 @@ impl App {
                     let (r, _) = ui.allocate_exact_size(vec2(16.0, 16.0), Sense::hover());
                     icons::paint(ui.painter(), r, c.icon(), p.muted);
                     ui.add(
-                        Label::new(RichText::new(c.label()).strong().color(p.muted))
-                            .sense(Sense::click()),
+                        Label::new(
+                            RichText::new(c.label())
+                                .family(theme::semibold())
+                                .color(p.muted),
+                        )
+                        .sense(Sense::click()),
                     )
                     .on_hover_cursor(CursorIcon::PointingHand)
                     .on_hover_text("Open this page")
@@ -405,7 +412,7 @@ fn switch(ui: &mut egui::Ui, on: &mut bool) -> Response {
         response.mark_changed();
     }
     let t = ui.ctx().animate_bool_responsive(response.id, *on);
-    let off = p.muted.gamma_multiply(0.55);
+    let off = p.border_strong;
     let track = Color32::from_rgba_premultiplied(
         lerp(off.r(), p.accent.r(), t),
         lerp(off.g(), p.accent.g(), t),
@@ -453,7 +460,7 @@ pub fn data_folder(app: &mut App, ui: &mut egui::Ui) {
         Label::new(
             RichText::new(dir.display().to_string())
                 .monospace()
-                .size(11.5)
+                .size(12.0)
                 .color(p.text),
         )
         .wrap()
@@ -509,18 +516,18 @@ pub fn grid_names(app: &mut App, ui: &mut egui::Ui) {
                 cell,
             );
             if (r, c) == (1, 2) {
-                painter.rect_filled(box_rect, 0.0, theme::GRID_FILL);
+                painter.rect_filled(box_rect, 0.0, theme::OVERLAY.grid_fill);
             }
             painter.text(
                 box_rect.center(),
                 egui::Align2::CENTER_CENTER,
                 format!("{r}x{c}"),
-                FontId::proportional(11.5),
-                theme::GRID_TEXT,
+                FontId::proportional(12.0),
+                theme::OVERLAY.grid_text,
             );
         }
     }
-    let stroke = Stroke::new(1.0, theme::GRID_LINE);
+    let stroke = Stroke::new(1.0, theme::OVERLAY.grid_line);
     for i in 1..3 {
         painter.vline(rect.min.x + i as f32 * cell.x, rect.y_range(), stroke);
         painter.hline(rect.x_range(), rect.min.y + i as f32 * cell.y, stroke);
@@ -690,12 +697,17 @@ pub fn about(app: &mut App, ui: &mut egui::Ui) {
         update::open_url(REPO);
     }
     ui.add_space(S2);
-    ui.label(RichText::new("Credits").strong().color(p.text));
+    ui.label(
+        RichText::new("Credits")
+            .family(theme::semibold())
+            .color(p.text),
+    );
     for line in [
         "SkyBoT — IMCCE, Observatoire de Paris",
         "MPCORB orbit catalogue — Minor Planet Center",
         "VSOP87 planetary theory — P. Bretagnon & G. Francou",
         "Planetary data — NASA JPL",
+        "Typefaces — Inter (SIL OFL 1.1), Hack (MIT)",
     ] {
         small(ui, format!("·  {line}"), p.muted);
     }

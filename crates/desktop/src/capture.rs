@@ -24,7 +24,11 @@
 //! `objects=FILE` (a report's objects as the student's own), `marking`
 //! (continue marking the last of them), `report=FILE` (import a student's
 //! report to review), `export=FILE` (write the detailed report with cutouts
-//! there; needs `OPENCERES_HISTORY_DIR`) and `size=WxH` (window size in points).
+//! there; needs `OPENCERES_HISTORY_DIR`), `delete=N`, `edit=N` (delete or edit
+//! the Nth of the objects, 1-based), `clear` (the Clear button), `askgrid=N`
+//! (ask to change the grid to N), `snap=source|clicked` (last placement shown
+//! while marking), `expired` (a made-up team match whose session ended) and
+//! `size=WxH` (window size in points).
 
 use eframe::egui;
 
@@ -55,6 +59,12 @@ pub struct State {
     pub marking: bool,
     pub report: Option<String>,
     pub export: Option<String>,
+    pub delete: Option<usize>,
+    pub edit: Option<usize>,
+    pub clear: bool,
+    pub ask_grid: Option<usize>,
+    pub snap: Option<String>,
+    pub expired: bool,
     pub size: Option<[f32; 2]>,
 }
 
@@ -124,6 +134,12 @@ impl State {
                 "marking" => s.marking = true,
                 "report" => s.report = Some(value.to_owned()),
                 "export" => s.export = Some(value.to_owned()),
+                "delete" => s.delete = value.parse().ok(),
+                "edit" => s.edit = value.parse().ok(),
+                "clear" => s.clear = true,
+                "askgrid" => s.ask_grid = value.parse().ok(),
+                "snap" => s.snap = Some(value.to_owned()),
+                "expired" => s.expired = true,
                 "size" => {
                     s.size = pair(value).map(|(w, h)| [w as f32, h as f32]);
                 }

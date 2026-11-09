@@ -28,6 +28,8 @@ use crate::theme::{self, S1, S2, S3, S4, S5, palette};
 
 const WINDOW: [f32; 2] = [560.0, 520.0];
 const FIELD: f32 = 280.0;
+/// Shown in place of a Submit that failed because the session had ended.
+const NOT_SENT: &str = "You were signed out, so this wasn't sent. Your search is saved here.";
 
 /// A finished request.
 enum Event {
@@ -90,6 +92,9 @@ pub(super) struct Team {
     looking_up: bool,
     lookup_error: Option<String>,
     pub matched: Option<Match>,
+    /// The server ended the session while this set was open (not a
+    /// sign-out): its section stays and offers signing in again.
+    expired: bool,
     fetching: bool,
     hidden: bool,
     /// Ids of the reports shown from the server.
@@ -142,6 +147,7 @@ impl Team {
             looking_up: false,
             lookup_error: None,
             matched: None,
+            expired: false,
             fetching: false,
             hidden: false,
             shared: Vec::new(),
@@ -195,6 +201,7 @@ impl Team {
         self.looking_up = false;
         self.lookup_error = None;
         self.matched = None;
+        self.expired = false;
         self.fetching = false;
         self.hidden = false;
         self.submitting = false;
@@ -207,7 +214,12 @@ impl Team {
     fn failed(&mut self, e: ApiError) -> String {
         match &e {
             ApiError::SignedOut(_) => {
+                // Unlike a sign-out, nobody asked for this: keep the set's
+                // section so what happened to their work stays visible.
+                let matched = self.matched.take();
                 self.forget_session();
+                self.matched = matched;
+                self.expired = true;
                 self.account_error = Some("You were signed out. Please sign in again.".into());
             }
             ApiError::MustChangePassword => self.must_change = true,
@@ -264,6 +276,7 @@ impl App {
             .map(|s| s.frames.iter().map(|f| f.name.clone()).collect())
             .unwrap_or_default();
         t.matched = None;
+        t.expired = false;
         t.lookup_error = None;
         t.looking_up = false;
         t.fetching = false;
@@ -404,6 +417,8 @@ impl App {
                         t.password.clear();
                         t.account_error = None;
                         t.account_note = None;
+                        t.expired = false;
+                        t.submit_error = None;
                         self.team_start();
                         self.team_lookup();
                         if self.team.window_open {
@@ -511,7 +526,15 @@ impl App {
                         // Others' findings may be visible now.
                         self.team_fetch_findings();
                     }
-                    Err(e) => t.submit_error = Some(t.failed(e)),
+                    Err(e) => {
+                        let signed_out = matches!(e, ApiError::SignedOut(_));
+                        let message = t.failed(e);
+                        t.submit_error = Some(if signed_out {
+                            NOT_SENT.to_owned()
+                        } else {
+                            message
+                        });
+                    }
                 }
             }
         }
@@ -642,6 +665,10 @@ impl App {
             spinner_line(ui, "Asking the team server about this set…");
             return;
         }
+        if t.expired && t.matched.is_none() {
+            self.signed_out_row(ui, "You were signed out. Sign in to check this set.");
+            return;
+        }
         if let Some(e) = &t.lookup_error {
             small(ui, format!("Couldn't ask the team server: {e}"), p.danger);
             if ui.small_button("Try again").clicked() {
@@ -657,7 +684,14 @@ impl App {
             .show(ui, |ui| {
                 ui.set_width(ui.available_width());
                 ui.spacing_mut().item_spacing.y = 2.0;
-                ui.add(Label::new(RichText::new(m.badge()).strong().color(p.accent)).wrap());
+                ui.add(
+                    Label::new(
+                        RichText::new(m.badge())
+                            .family(theme::semibold())
+                            .color(p.accent),
+                    )
+                    .wrap(),
+                );
                 let mut parts = Vec::new();
                 if !m.team.name.is_empty() {
                     parts.push(m.team.name.clone());
@@ -674,6 +708,10 @@ impl App {
                     small(ui, parts.join(" · "), p.text);
                 }
             });
+        if t.expired {
+            self.signed_out_row(ui, "You were signed out. Sign in to submit your review.");
+            return;
+        }
         // The server takes reviews from those assigned and from teachers.
         let allowed = m.assigned || m.role == "teacher";
         let can_submit = allowed
@@ -741,6 +779,37 @@ impl App {
         }
         if refresh {
             self.team_fetch_findings();
+        }
+    }
+
+    /// A made-up session that ended on Submit, to see how that looks.
+    pub(super) fn team_capture_expired(&mut self) {
+        let t = &mut self.team;
+        t.matched = Some(Match {
+            code: "XY57".into(),
+            campaign: team::Campaign {
+                name: "October Campaign".into(),
+                ..team::Campaign::default()
+            },
+            assigned: true,
+            ..Match::default()
+        });
+        t.expired = true;
+        t.submit_error = Some(NOT_SENT.to_owned());
+    }
+
+    /// What the section shows once the session has ended: why Submit is
+    /// gone (or what became of the last one) and the way back.
+    fn signed_out_row(&mut self, ui: &mut egui::Ui, fallback: &str) {
+        let p = palette(ui);
+        let text = self.team.submit_error.as_deref().unwrap_or(fallback);
+        small(ui, text.to_owned(), p.danger);
+        if ui
+            .add(primary(ui, "Sign in…"))
+            .on_hover_text("Settings → Team")
+            .clicked()
+        {
+            self.open_settings(Category::Team);
         }
     }
 
@@ -869,7 +938,11 @@ impl App {
         }
 
         ui.add_space(S3);
-        ui.label(RichText::new("My assignments").strong().color(p.text));
+        ui.label(
+            RichText::new("My assignments")
+                .family(theme::semibold())
+                .color(p.text),
+        );
         match &t.assignments {
             None => {}
             Some(list) if list.is_empty() => {
@@ -887,7 +960,11 @@ impl App {
         }
 
         ui.add_space(S4);
-        ui.label(RichText::new("Announcements").strong().color(p.text));
+        ui.label(
+            RichText::new("Announcements")
+                .family(theme::semibold())
+                .color(p.text),
+        );
         match &t.announcements {
             None => {}
             Some(list) if list.is_empty() => muted_wrapped(ui, "No announcements."),
@@ -910,7 +987,7 @@ impl App {
         if forced {
             ui.label(
                 RichText::new("Choose a new password")
-                    .strong()
+                    .family(theme::semibold())
                     .color(p.text),
             );
             muted_wrapped(
@@ -991,7 +1068,11 @@ fn assignment_row(ui: &mut egui::Ui, a: &Assignment, open: bool) {
             ui.set_width(ui.available_width());
             ui.spacing_mut().item_spacing.y = 2.0;
             ui.horizontal(|ui| {
-                ui.label(RichText::new(&a.code).strong().color(p.text));
+                ui.label(
+                    RichText::new(&a.code)
+                        .family(theme::semibold())
+                        .color(p.text),
+                );
                 if open {
                     ui.label(RichText::new("open now").small().color(p.accent));
                 }
@@ -1163,7 +1244,8 @@ pub fn account_setting(app: &mut App, ui: &mut egui::Ui) {
     } else {
         small(
             ui,
-            "Your teacher gives you an account or an invite code for the server.",
+            "Sign up on your team's website with the invite code from your teacher, then \
+             sign in here.",
             p.muted,
         );
     }
@@ -1181,5 +1263,28 @@ mod tests {
         assert_eq!(capitalized("in_progress"), "In progress");
         assert_eq!(capitalized(""), "");
         assert_eq!(capitalized("ödev"), "Ödev");
+    }
+
+    fn signed_in_with_a_match() -> Team {
+        let mut t = Team::new(&egui::Context::default(), false);
+        t.config.url = "https://team.example.org".into();
+        t.config.token = "token".into();
+        t.matched = Some(Match::default());
+        t
+    }
+
+    #[test]
+    fn an_ended_session_keeps_the_section() {
+        let mut t = signed_in_with_a_match();
+        t.failed(ApiError::SignedOut("401".into()));
+        assert!(t.matched.is_some() && t.expired);
+        assert!(!t.ready(), "the session itself is gone");
+    }
+
+    #[test]
+    fn signing_out_clears_the_section() {
+        let mut t = signed_in_with_a_match();
+        t.forget_session();
+        assert!(t.matched.is_none() && !t.expired);
     }
 }

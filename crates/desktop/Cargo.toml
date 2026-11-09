@@ -15,10 +15,11 @@ path = "src/main.rs"
 
 [dependencies]
 openceres-core = { path = "../core" }
-# Window, input and immediate-mode UI. Only the OpenGL (glow) renderer, the
-# built-in font and the Linux window systems: no wgpu, persistence, accesskit
-# or link opening, which together would several-fold the binary.
-eframe = { version = "=0.36.2", default-features = false, features = ["glow", "default_fonts", "x11", "wayland"] }
+# Window, input and immediate-mode UI. Only the OpenGL (glow) renderer and the
+# Linux window systems: no wgpu, persistence, accesskit or link opening, which
+# together would several-fold the binary. No default_fonts either: the app
+# embeds its own subsets of Inter and Hack (see theme.rs).
+eframe = { version = "=0.36.2", default-features = false, features = ["glow", "x11", "wayland"] }
 # Native "open files" dialog (NSOpenPanel / Windows / XDG portal); the portal
 # backend avoids linking GTK on Linux.
 rfd = { version = "=0.17.2", default-features = false, features = ["xdg-portal"] }

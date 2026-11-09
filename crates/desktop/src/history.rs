@@ -284,6 +284,10 @@ pub struct Record {
     pub grid: usize,
     /// Marked boxes as (row, column), 1-based from the top-left.
     pub boxes: Vec<(usize, usize)>,
+    /// Those of `boxes` that are only there because an object was marked in
+    /// them; they go with their last object. A box the student clicked is
+    /// never in this list, so it stays when objects are deleted.
+    pub object_boxes: Vec<(usize, usize)>,
     pub status: Status,
     /// e.g. a team's preliminary designation or `2026 UX12`.
     pub designation: String,
@@ -381,7 +385,7 @@ impl Record {
                 format!("[\n{}\n{indent}  ]", items.join(",\n"))
             }
         };
-        let boxes: Vec<String> = self.boxes.iter().map(|&b| box_label(b)).collect();
+        let labels = |b: &[(usize, usize)]| b.iter().map(|&b| box_label(b)).collect::<Vec<_>>();
         let opt = |v: &Option<String>| v.as_deref().map_or_else(|| "null".into(), json::quote);
         let fields = [
             ("format", json::quote(RECORD_FORMAT)),
@@ -394,7 +398,11 @@ impl Record {
             ("created", self.created.to_string()),
             ("updated", self.updated.to_string()),
             ("grid", self.grid.to_string()),
-            ("boxes", json::string_array(&boxes)),
+            ("boxes", json::string_array(&labels(&self.boxes))),
+            (
+                "object_boxes",
+                json::string_array(&labels(&self.object_boxes)),
+            ),
             ("report", json::quote(&self.report())),
             ("status", json::quote(self.status.key())),
             ("designation", json::quote(&self.designation)),
@@ -437,11 +445,13 @@ impl Record {
         let id = text("id").filter(|id| is_safe_id(id))?;
         let set = text("set").filter(|s| !s.trim().is_empty())?;
         let grid = number("grid").map_or(4, |g| g as usize).clamp(1, 12);
-        let boxes = list("boxes")
-            .iter()
-            .filter_map(|b| parse_box(b))
-            .filter(|&(r, c)| r <= grid && c <= grid)
-            .collect();
+        let boxes = |key: &str| {
+            list(key)
+                .iter()
+                .filter_map(|b| parse_box(b))
+                .filter(|&(r, c)| r <= grid && c <= grid)
+                .collect::<Vec<_>>()
+        };
         let created = number("created").unwrap_or(0);
         let frames: Vec<FrameRef> = v
             .get("frames")
@@ -474,7 +484,8 @@ impl Record {
             created,
             updated: number("updated").unwrap_or(created),
             grid,
-            boxes,
+            boxes: boxes("boxes"),
+            object_boxes: boxes("object_boxes"),
             status: text("status")
                 .and_then(|s| Status::from_key(&s))
                 .unwrap_or_default(),
@@ -805,6 +816,7 @@ mod tests {
             updated: 1_793_349_800,
             grid: 4,
             boxes: vec![(2, 3), (1, 4)],
+            object_boxes: vec![(2, 3)],
             status: Status::Provisional,
             designation: "2026 UX12".into(),
             notes: "Faint, \"moving\" fast\nsecond line".into(),
