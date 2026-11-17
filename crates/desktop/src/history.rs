@@ -101,6 +101,13 @@ pub struct FrameRef {
     pub time: Option<String>,
 }
 
+/// The nearest of the eight compass points to a position angle (degrees
+/// east of north).
+pub fn compass(degrees: f64) -> &'static str {
+    const POINTS: [&str; 8] = ["N", "NE", "E", "SE", "S", "SW", "W", "NW"];
+    POINTS[((degrees.rem_euclid(360.0) / 45.0).round() as usize) % 8]
+}
+
 /// One object a student marked, frame by frame (the detailed report).
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct Tagged {
@@ -117,6 +124,14 @@ pub struct Tagged {
     pub direction: Option<f64>,
     /// The known object it lines up with, e.g. `133105 2003 OG10`.
     pub known: Option<String>,
+    /// Marked as a discovery (`*` on its first line in the MPC report).
+    pub discovery: bool,
+    /// Left out of the MPC report.
+    pub exclude: bool,
+    /// Per frame (same index as `at`): the mark was placed where the
+    /// student clicked or at the prediction, not snapped to a detected
+    /// source, so the report asks them to check it.
+    pub unsnapped: Vec<bool>,
 }
 
 impl Tagged {
@@ -124,19 +139,21 @@ impl Tagged {
         self.at.iter().flatten().count()
     }
 
-    /// e.g. `A · 2x3 · 0.64″/min · 249°`.
+    /// e.g. `A · 0.52″/min toward SE`.
     pub fn summary(&self) -> String {
-        let mut parts = vec![self.label.clone()];
-        if let Some(c) = self.cell {
-            parts.push(box_label(c));
+        match self.motion() {
+            Some(m) => format!("{} · {m}", self.label),
+            None => self.label.clone(),
         }
-        if let Some(r) = self.rate {
-            parts.push(format!("{r:.2}″/min"));
-        }
-        if let Some(d) = self.direction {
-            parts.push(format!("{d:.0}°"));
-        }
-        parts.join(" · ")
+    }
+
+    /// `0.52″/min toward SE` (on the sky: north up, east left).
+    pub fn motion(&self) -> Option<String> {
+        let rate = self.rate?;
+        Some(match self.direction {
+            Some(d) => format!("{rate:.2}″/min toward {}", compass(d)),
+            None => format!("{rate:.2}″/min"),
+        })
     }
 
     /// `"label": …` and the rest, as one JSON object. `cutout(frame)` may
@@ -154,8 +171,13 @@ impl Tagged {
                 let extra = cutout(i).map_or_else(String::new, |c| {
                     format!(", \"cutout\": {}", json::quote(&c))
                 });
+                let snapped = if self.unsnapped.get(i).copied().unwrap_or(false) {
+                    ", \"snapped\": false"
+                } else {
+                    ""
+                };
                 Some(format!(
-                    "{indent}      {{\"frame\": {}, \"x\": {x:.2}, \"y\": {y:.2}{extra}}}",
+                    "{indent}      {{\"frame\": {}, \"x\": {x:.2}, \"y\": {y:.2}{snapped}{extra}}}",
                     i + 1
                 ))
             })
@@ -175,6 +197,8 @@ impl Tagged {
                     .as_deref()
                     .map_or_else(|| "null".into(), json::quote),
             ),
+            ("discovery", self.discovery.to_string()),
+            ("exclude", self.exclude.to_string()),
             (
                 "positions",
                 if positions.is_empty() {
@@ -197,6 +221,7 @@ impl Tagged {
             return None;
         }
         let mut at = vec![None; frames];
+        let mut unsnapped = vec![false; frames];
         for p in v.get("positions").and_then(Value::as_array).unwrap_or(&[]) {
             let n = |k: &str| p.get(k).and_then(Value::as_f64).filter(|n| n.is_finite());
             let (Some(f), Some(x), Some(y)) = (n("frame"), n("x"), n("y")) else {
@@ -204,8 +229,11 @@ impl Tagged {
             };
             if f >= 1.0 && (f as usize) <= frames {
                 at[f as usize - 1] = Some((x, y));
+                unsnapped[f as usize - 1] =
+                    p.get("snapped").and_then(Value::as_bool) == Some(false);
             }
         }
+        let flag = |k: &str| v.get(k).and_then(Value::as_bool).unwrap_or(false);
         let num = |k: &str| v.get(k).and_then(Value::as_f64).filter(|n| n.is_finite());
         Some(Tagged {
             label,
@@ -214,6 +242,9 @@ impl Tagged {
             rate: num("rate"),
             direction: num("direction"),
             known: v.get("known").and_then(Value::as_str).map(str::to_owned),
+            discovery: flag("discovery"),
+            exclude: flag("exclude"),
+            unsnapped,
         })
     }
 }
@@ -247,12 +278,18 @@ pub fn remap(objects: &[Tagged], map: &[Option<usize>], frames: usize) -> Vec<Ta
         .iter()
         .map(|o| {
             let mut at = vec![None; frames];
+            let mut unsnapped = vec![false; frames];
             for (i, p) in o.at.iter().enumerate() {
                 if let (Some(p), Some(Some(j))) = (p, map.get(i)) {
                     at[*j] = Some(*p);
+                    unsnapped[*j] = o.unsnapped.get(i).copied().unwrap_or(false);
                 }
             }
-            Tagged { at, ..o.clone() }
+            Tagged {
+                at,
+                unsnapped,
+                ..o.clone()
+            }
         })
         .collect()
 }
@@ -300,6 +337,12 @@ pub struct Record {
     pub frames: Vec<FrameRef>,
     /// Objects marked frame by frame (the detailed report).
     pub objects: Vec<Tagged>,
+    /// Temporary designations of the MPC report: prefix and first number.
+    pub desig_prefix: String,
+    pub desig_start: u32,
+    /// The MPC report as last copied, and when (Unix time).
+    pub mpc_report: String,
+    pub mpc_copied: Option<u64>,
 }
 
 impl Record {
@@ -312,6 +355,7 @@ impl Record {
             created: now,
             updated: now,
             grid,
+            desig_start: 1,
             ..Record::default()
         }
     }
@@ -411,6 +455,14 @@ impl Record {
             ("files", json::string_array(&self.files)),
             ("frames", list(&frames)),
             ("objects", list(&objects)),
+            ("desig_prefix", json::quote(&self.desig_prefix)),
+            ("desig_start", self.desig_start.to_string()),
+            ("mpc_report", json::quote(&self.mpc_report)),
+            (
+                "mpc_copied",
+                self.mpc_copied
+                    .map_or_else(|| "null".into(), |t| t.to_string()),
+            ),
             ("app", json::quote(crate::update::CURRENT_VERSION)),
         ];
         let body: Vec<String> = fields
@@ -495,6 +547,10 @@ impl Record {
             files: list("files"),
             frames,
             objects,
+            desig_prefix: text("desig_prefix").unwrap_or_default(),
+            desig_start: number("desig_start").map_or(1, |n| n.min(9_999_999) as u32),
+            mpc_report: text("mpc_report").unwrap_or_default(),
+            mpc_copied: number("mpc_copied"),
         })
     }
 }
@@ -839,7 +895,14 @@ mod tests {
                 rate: Some(0.642),
                 direction: Some(249.5),
                 known: Some("133105 2003 OG10".into()),
+                discovery: true,
+                exclude: false,
+                unsnapped: vec![true, false],
             }],
+            desig_prefix: "TRK".into(),
+            desig_start: 12,
+            mpc_report: "COD F51\nOBS A. B\n".into(),
+            mpc_copied: Some(1_793_349_900),
         }
     }
 
@@ -880,6 +943,26 @@ mod tests {
         assert_eq!(
             (object_label(0), object_label(25), object_label(26)),
             ("A".into(), "Z".into(), "AA".into())
+        );
+    }
+
+    #[test]
+    fn summary_reads_as_a_direction() {
+        let o = Tagged {
+            label: "A".into(),
+            cell: Some((2, 3)),
+            rate: Some(0.523),
+            direction: Some(140.0),
+            ..Tagged::default()
+        };
+        assert_eq!(o.summary(), "A · 0.52″/min toward SE");
+        assert_eq!(
+            (compass(0.0), compass(337.6), compass(-30.0)),
+            ("N", "N", "NW")
+        );
+        assert_eq!(
+            (compass(90.0), compass(202.0), compass(270.0)),
+            ("E", "S", "W")
         );
     }
 

@@ -1,6 +1,6 @@
 //! Known objects in the field: one lookup per image set, from IMCCE's SkyBoT
-//! service (online) or the MPC's MPCORB catalogue (offline, downloaded once
-//! into the app data folder).
+//! service (online) or the MPC's MPCORB catalogue and comet orbits (offline,
+//! downloaded into the app data folder and refreshed together).
 //!
 //! Network access goes through the system `curl` (shipped with macOS,
 //! Windows 10/11 and practically every Linux), so the app links no HTTP or
@@ -15,7 +15,9 @@ use std::sync::mpsc::Receiver;
 use std::time::Duration;
 
 use eframe::egui;
-use openceres_core::known::{self, FieldQuery, KnownObject, mpcorb_date, mpcorb_search};
+use openceres_core::known::{
+    self, FieldQuery, KnownObject, comet_count, comet_search, mpcorb_date, mpcorb_search,
+};
 
 use crate::gz::GzReader;
 use crate::load::Frame;
@@ -23,6 +25,9 @@ use crate::prefs::{self, KnownSource};
 
 const MPCORB_URL: &str = "https://www.minorplanetcenter.net/iau/MPCORB/MPCORB.DAT.gz";
 const MPCORB_FILE: &str = "MPCORB.DAT.gz";
+/// The MPC's comet orbits, one line each (~170 kB, updated daily).
+const COMETS_URL: &str = "https://www.minorplanetcenter.net/iau/MPCORB/CometEls.txt";
+const COMETS_FILE: &str = "CometEls.txt";
 const OFFLINE: &str = "Couldn't reach SkyBoT — check the internet connection, or switch to \
                        the offline MPCORB catalogue in Settings.";
 const NO_CURL: &str = "Couldn't run curl, which OpenCeres uses to go online. Install curl, \
@@ -98,9 +103,22 @@ pub fn start(
     rx
 }
 
+/// The source a lookup with `source` uses now: Automatic is MPCORB once
+/// the catalogue is on this computer, SkyBoT until then.
+pub fn effective(source: KnownSource) -> KnownSource {
+    match source {
+        KnownSource::Auto if catalogue_path().is_some_and(|p| p.is_file()) => KnownSource::Mpcorb,
+        KnownSource::Auto => KnownSource::SkyBot,
+        s => s,
+    }
+}
+
 fn lookup(source: KnownSource, field: &Field) -> Result<Lookup, LookupError> {
+    let source = effective(source);
     let (objects, catalogue) = match source {
-        KnownSource::SkyBot => (skybot(field).map_err(LookupError::Message)?, None),
+        KnownSource::Auto | KnownSource::SkyBot => {
+            (skybot(field).map_err(LookupError::Message)?, None)
+        }
         KnownSource::Mpcorb => {
             let path = catalogue_path()
                 .filter(|p| p.is_file())
@@ -112,9 +130,14 @@ fn lookup(source: KnownSource, field: &Field) -> Result<Lookup, LookupError> {
                 jd: field.jd,
                 observatory: field.observatory.clone(),
             };
-            let objects = open_catalogue(&path)
+            let mut objects = open_catalogue(&path)
                 .and_then(|r| mpcorb_search(BufReader::new(r), &query))
                 .map_err(LookupError::Message)?;
+            // Comets when their file is here (older installs have only MPCORB).
+            if let Some(file) = comets_path().and_then(|p| std::fs::File::open(p).ok()) {
+                let comets = comet_search(BufReader::new(file), &query);
+                objects.extend(comets.map_err(LookupError::Message)?);
+            }
             (objects, catalogue_date(&path))
         }
     };
@@ -219,10 +242,26 @@ pub fn catalogue_date(path: &Path) -> Option<String> {
     mpcorb_date(BufReader::new(open_catalogue(path).ok()?))
 }
 
+pub fn comets_path() -> Option<PathBuf> {
+    prefs::data_dir().map(|d| d.join(COMETS_FILE))
+}
+
 /// What Settings shows about the catalogue; read once, not every frame.
 pub enum Catalogue {
     Missing,
-    Present { date: Option<String>, bytes: u64 },
+    Present {
+        date: Option<String>,
+        bytes: u64,
+        /// The comet orbits, if downloaded.
+        comets: Option<Comets>,
+    },
+}
+
+/// The local comet orbits: how many, and the server's date of the file
+/// (`curl -R` gives the file its Last-Modified time).
+pub struct Comets {
+    pub count: usize,
+    pub modified: Option<u64>,
 }
 
 pub fn catalogue_info() -> Catalogue {
@@ -233,9 +272,50 @@ pub fn catalogue_info() -> Catalogue {
         Some(version) => Catalogue::Present {
             date: catalogue_date(&path),
             bytes: version.length.unwrap_or(0),
+            comets: comets_info(),
         },
         None => Catalogue::Missing,
     }
+}
+
+fn comets_info() -> Option<Comets> {
+    let file = std::fs::File::open(comets_path()?).ok()?;
+    let modified = file
+        .metadata()
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs());
+    let count = comet_count(BufReader::new(file));
+    (count > 0).then_some(Comets { count, modified })
+}
+
+/// Downloads the comet orbits (small, so in one go) into a `.part` file,
+/// checks that it holds comet orbits, and only then replaces the old file.
+/// True if the file changed.
+fn fetch_comets() -> Result<bool, String> {
+    let path = comets_path().ok_or("Couldn't find the app's data folder.")?;
+    let part = path.with_extension("txt.part");
+    let status = curl()
+        .args(["-sSfLR", "--max-time", "120", "-o"])
+        .arg(&part)
+        .arg(COMETS_URL)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map_err(|_| NO_CURL.to_owned())?;
+    let new = std::fs::read(&part).unwrap_or_default();
+    if !status.success() || comet_count(&new[..]) == 0 {
+        let _ = std::fs::remove_file(&part);
+        return Err("Couldn't download the comet orbits.".into());
+    }
+    if std::fs::read(&path).is_ok_and(|old| old == new) {
+        let _ = std::fs::remove_file(&part);
+        return Ok(false);
+    }
+    std::fs::rename(&part, &path).map_err(|e| format!("Couldn't save the comet orbits: {e}"))?;
+    Ok(true)
 }
 
 /// What tells one version of the catalogue on the MPC server from another:
@@ -450,6 +530,10 @@ fn download(
     let headers = path.with_extension("gz.headers");
     let _ = std::fs::remove_file(&part);
 
+    // The comet orbits first: they change daily and are tiny. A failure
+    // there keeps the old file and does not stop the asteroid catalogue.
+    let comets_changed = fetch_comets().unwrap_or(false);
+
     // The server's version: skips an unchanged catalogue and gives the size
     // for progress. The download works without it.
     let remote = remote_version().ok();
@@ -457,7 +541,11 @@ fn download(
         if let Some(local) = local_version(&path)
             && !remote.is_newer_than(&local)
         {
-            return Ok(Fetched::AlreadyCurrent);
+            return Ok(if comets_changed {
+                Fetched::Downloaded
+            } else {
+                Fetched::AlreadyCurrent
+            });
         }
         if let Some(n) = remote.length {
             total.store(n, Ordering::Relaxed);

@@ -5,7 +5,7 @@ use std::process::ExitCode;
 
 use openceres_core::detect::{self, DetectOptions};
 use openceres_core::fits::{self, Image, Value};
-use openceres_core::{align, known, time, wcs::Wcs};
+use openceres_core::{align, gaia, known, plate, reduce, time, wcs::Wcs};
 
 const USAGE: &str = "\
 Usage:
@@ -17,6 +17,11 @@ Usage:
                                            offline from an uncompressed MPCORB.DAT (`-` = stdin)
   openceres align <image.fits>...          how each frame maps onto the first by matching stars,
                                            compared with what the frames' WCS headers say
+  openceres solve <image.fits>... [--gaia <file.tsv>] [--mark <x>,<y>]...
+                                           plate solution of each frame against Gaia DR3 (fetched
+                                           from VizieR with curl, or read from/saved to the file),
+                                           with residuals, the photometric zero point, and the
+                                           measured position and magnitude at each mark
 
 Options for `stars`:
   --sigma <n>    detection threshold in noise sigmas (default 5)
@@ -28,6 +33,7 @@ fn main() -> ExitCode {
         Some("info") if args.len() > 1 => info(&args[1..]),
         Some("stars") if args.len() > 1 => stars(&args[1..]),
         Some("align") if args.len() > 2 => align(&args[1..]),
+        Some("solve") if args.len() > 1 => solve(&args[1..]),
         Some("known") if args.len() == 2 => known_objects(&args[1], None),
         Some("known") if args.len() == 4 && args[2] == "--mpcorb" => {
             known_objects(&args[1], Some(&args[3]))
@@ -285,6 +291,181 @@ fn align(paths: &[String]) -> Result<()> {
                 );
             }
         }
+    }
+    Ok(())
+}
+
+/// Gaia DR3 stars around a frame: from `file` if it exists, else from the
+/// first VizieR mirror that answers with stars (then saved to `file`).
+fn gaia_stars(image: &Image, file: Option<&str>) -> Result<Vec<gaia::GaiaStar>> {
+    if let Some(f) = file
+        && let Ok(text) = std::fs::read_to_string(f)
+    {
+        return Ok(gaia::parse_tsv(&text)?);
+    }
+    let wcs = Wcs::from_header(&image.header).ok_or("image has no WCS")?;
+    let (w, h) = (image.width as f64, image.height as f64);
+    let (ra, dec) = wcs.pixel_to_sky((w - 1.0) / 2.0, (h - 1.0) / 2.0);
+    let radius = w.hypot(h) / 2.0 * wcs.pixel_scale() / 3600.0 + 0.02;
+    let mut errors = Vec::new();
+    for mirror in &gaia::MIRRORS {
+        let url = gaia::query_url(mirror, ra, dec, radius);
+        let started = std::time::Instant::now();
+        let reply = std::process::Command::new("curl")
+            .args(["-sS", "--max-time", "30", &url])
+            .output()
+            .map_err(|e| format!("cannot run curl: {e}"))?;
+        let text = String::from_utf8_lossy(&reply.stdout);
+        match gaia::parse_tsv(&text) {
+            Ok(stars) => {
+                eprintln!(
+                    "Gaia DR3: {} stars from {} in {:.1} s",
+                    stars.len(),
+                    mirror.name,
+                    started.elapsed().as_secs_f64()
+                );
+                if let Some(f) = file {
+                    std::fs::write(f, text.as_bytes())?;
+                }
+                return Ok(stars);
+            }
+            Err(e) => errors.push(format!("{}: {e}", mirror.name)),
+        }
+    }
+    Err(format!("no VizieR mirror answered: {}", errors.join("; ")).into())
+}
+
+fn solve(args: &[String]) -> Result<()> {
+    let mut paths = Vec::new();
+    let mut gaia_file = None;
+    let mut marks = Vec::new();
+    let mut rest = args.iter();
+    while let Some(a) = rest.next() {
+        match a.as_str() {
+            "--gaia" => gaia_file = Some(rest.next().ok_or("--gaia needs a file")?.clone()),
+            "--mark" => {
+                let v = rest.next().ok_or("--mark needs x,y")?;
+                let (x, y) = v.split_once(',').ok_or("--mark needs x,y")?;
+                marks.push((x.trim().parse::<f64>()?, y.trim().parse::<f64>()?));
+            }
+            _ => paths.push(a.clone()),
+        }
+    }
+    let mut catalog: Option<Vec<gaia::GaiaStar>> = None;
+    for path in &paths {
+        let image = load(path)?;
+        if catalog.is_none() {
+            catalog = Some(gaia_stars(&image, gaia_file.as_deref())?);
+        }
+        let cat = catalog.as_deref().unwrap_or_default();
+        let started = std::time::Instant::now();
+        let red = reduce::reduce(&image, Some(cat), &marks);
+        println!("{path}");
+        println!(
+            "  {} stars detected, FWHM {:.2} px, reduced in {:.2} s",
+            red.detected,
+            red.fwhm,
+            started.elapsed().as_secs_f64()
+        );
+        match red.solution.as_ref().ok_or("no solution")? {
+            Err(e) => println!("  plate solution failed: {e}"),
+            Ok(sol) => {
+                println!(
+                    "  plate: order {}, {} of {} matched stars used, RMS {:.3}″ (RA) {:.3}″ (Dec), scale {:.4}″/px",
+                    sol.order,
+                    sol.stars,
+                    sol.matched.len(),
+                    sol.rms.0,
+                    sol.rms.1,
+                    sol.pixel_scale()
+                );
+                let cv: Vec<String> = sol
+                    .cv_rms
+                    .iter()
+                    .enumerate()
+                    .map(|(i, c)| {
+                        c.map_or(format!("order {}: -", i + 1), |c| {
+                            format!("order {}: {c:.3}″", i + 1)
+                        })
+                    })
+                    .collect();
+                println!("  cross-validated RMS  {}", cv.join(", "));
+                if let Some(p) = sol.problem() {
+                    println!("  PROBLEM: {p}");
+                }
+                // How far the header WCS is from Gaia on the same stars.
+                if let Some(wcs) = Wcs::from_header(&image.header) {
+                    let mut d: Vec<f64> = sol
+                        .matched
+                        .iter()
+                        .filter(|m| m.used)
+                        .map(|m| {
+                            let (ra, dec) = wcs.pixel_to_sky(m.x, m.y);
+                            ((ra - m.ra) * m.dec.to_radians().cos()).hypot(dec - m.dec) * 3600.0
+                        })
+                        .collect();
+                    d.sort_by(f64::total_cmp);
+                    if let (Some(lo), Some(hi)) = (d.first(), d.last()) {
+                        println!(
+                            "  header WCS vs Gaia: median {:.2}″, range {lo:.2}–{hi:.2}″",
+                            d[d.len() / 2]
+                        );
+                    }
+                }
+                // Residuals by magnitude.
+                for (lo, hi) in [(0.0, 16.0), (16.0, 18.0), (18.0, 19.5), (19.5, 25.0)] {
+                    let r: Vec<f64> = sol
+                        .matched
+                        .iter()
+                        .filter(|m| m.used && (lo..hi).contains(&m.mag))
+                        .map(|m| m.residual.0.hypot(m.residual.1))
+                        .collect();
+                    if !r.is_empty() {
+                        let rms =
+                            (r.iter().map(|v| v * v).sum::<f64>() / (2.0 * r.len() as f64)).sqrt();
+                        println!(
+                            "    G {lo:>4.1}–{hi:<4.1} {:>4} stars, per-axis RMS {rms:.3}″",
+                            r.len()
+                        );
+                    }
+                }
+            }
+        }
+        match &red.zero_point {
+            Some(z) => println!(
+                "  zero point G = {:.3} ± {:.3} − 2.5 log flux, {} stars, scatter {:.3} mag{}",
+                z.zp,
+                z.error,
+                z.stars,
+                z.scatter,
+                z.problem()
+                    .map_or(String::new(), |p| format!("  PROBLEM: {p}"))
+            ),
+            None => println!("  no zero point"),
+        }
+        for (mark, m) in marks.iter().zip(&red.marks) {
+            match m {
+                Ok(m) => println!(
+                    "  mark {:.1},{:.1} -> {:.2},{:.2}  RA {} Dec {} ± {}  S/N {:.1}  G {}",
+                    mark.0,
+                    mark.1,
+                    m.x,
+                    m.y,
+                    sexagesimal(m.ra / 15.0, false),
+                    sexagesimal(m.dec, true),
+                    m.sigma
+                        .map_or("-".into(), |s| format!("{:.3}″/{:.3}″", s.0, s.1)),
+                    m.snr(),
+                    m.mag
+                        .map_or("-".into(), |(v, e)| format!("{v:.2} ± {e:.2}"))
+                        + &m.mag_problem
+                            .as_ref()
+                            .map_or(String::new(), |p| format!(" ({p})"))
+                ),
+                Err(e) => println!("  mark {:.1},{:.1}: {e}", mark.0, mark.1),
+            }
+        }
+        let _ = plate::MAX_RMS;
     }
     Ok(())
 }

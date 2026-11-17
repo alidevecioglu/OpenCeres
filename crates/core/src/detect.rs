@@ -247,7 +247,7 @@ fn measure(image: &Image, members: &[usize], sky: f32, saturation: Option<f32>) 
     }
     // For a circular Gaussian, <r²> = 2σ² and FWHM = 2√(2 ln 2) σ.
     let sigma = (second / sum / 2.0).sqrt();
-    let (x, y) = windowed_centroid(image, sky, (cx, cy), sigma.max(0.5)).unwrap_or((cx, cy));
+    let (x, y) = windowed_centroid(image, sky, (cx, cy), sigma.max(0.5), 2.0).unwrap_or((cx, cy));
 
     Some(Star {
         x,
@@ -260,11 +260,91 @@ fn measure(image: &Image, members: &[usize], sky: f32, saturation: Option<f32>) 
     })
 }
 
+/// A measured position with its 1σ uncertainty, pixels.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Centroid {
+    pub x: f64,
+    pub y: f64,
+    pub sigma_x: f64,
+    pub sigma_y: f64,
+}
+
+/// Windowed centroid of the source near `start` (e.g. a student's click),
+/// with `psf_sigma` the frame's star width (FWHM / 2.355), `sky` the local
+/// sky level and `noise` its per-pixel sigma (ADU). `gain` (e⁻/ADU) adds
+/// the source's own photon noise. `None` if the window finds no source or
+/// wanders off (more than ~3 FWHM-sigmas from the mark).
+///
+/// The uncertainty propagates the pixel noise through the converged
+/// window equation F(x) = Σ (Iᵢ − sky) gᵢ (xᵢ − x) = 0 (gᵢ the Gaussian
+/// window): σₓ² = Σ varᵢ gᵢ² (xᵢ − x)² / (∂F/∂x)², the first-order error
+/// SExtractor's documentation gives for its windowed positions.
+pub fn centroid(
+    image: &Image,
+    start: (f64, f64),
+    psf_sigma: f64,
+    sky: f64,
+    noise: f64,
+    gain: Option<f64>,
+) -> Option<Centroid> {
+    let sigma = psf_sigma.max(0.5);
+    // A click can be a few pixels off: a wide window pulls it onto the
+    // source first, then the star-sized window measures it.
+    let near = windowed_centroid(
+        image,
+        sky as f32,
+        start,
+        2.0 * sigma,
+        (3.0 * sigma).max(4.0),
+    )?;
+    let (x, y) = windowed_centroid(image, sky as f32, near, sigma, 2.0)?;
+    let (w, h) = (image.width as isize, image.height as isize);
+    let radius = (4.0 * sigma).ceil() as isize;
+    let inv_2s2 = 1.0 / (2.0 * sigma * sigma);
+    let (x0, y0) = (x.round() as isize, y.round() as isize);
+    let (mut dfx, mut dfy, mut vx, mut vy) = (0.0, 0.0, 0.0, 0.0);
+    for py in (y0 - radius).max(0)..=(y0 + radius).min(h - 1) {
+        for px in (x0 - radius).max(0)..=(x0 + radius).min(w - 1) {
+            let (dx, dy) = (px as f64 - x, py as f64 - y);
+            let r2 = dx * dx + dy * dy;
+            if r2 > (radius * radius) as f64 {
+                continue;
+            }
+            let g = (-r2 * inv_2s2).exp();
+            let signal = image.data[(py * w + px) as usize] as f64 - sky;
+            let var = noise * noise
+                + gain
+                    .filter(|g| *g > 0.0)
+                    .map_or(0.0, |k| signal.max(0.0) / k);
+            // −∂F/∂x = Σ (I − sky) g (1 − dx²/σ²)
+            dfx += signal * g * (1.0 - dx * dx / (sigma * sigma));
+            dfy += signal * g * (1.0 - dy * dy / (sigma * sigma));
+            vx += var * g * g * dx * dx;
+            vy += var * g * g * dy * dy;
+        }
+    }
+    if dfx <= 0.0 || dfy <= 0.0 {
+        return None;
+    }
+    Some(Centroid {
+        x,
+        y,
+        sigma_x: vx.sqrt() / dfx,
+        sigma_y: vy.sqrt() / dfy,
+    })
+}
+
 /// Refines a centroid with an iterative Gaussian-weighted window (as in
 /// SExtractor's XWIN). The thresholded first moment is biased by noise for
 /// faint stars; the window uses every pixel near the star, unclipped, which
 /// gives an unbiased and much more precise position.
-fn windowed_centroid(image: &Image, sky: f32, start: (f64, f64), sigma: f64) -> Option<(f64, f64)> {
+fn windowed_centroid(
+    image: &Image,
+    sky: f32,
+    start: (f64, f64),
+    sigma: f64,
+    max_move: f64,
+) -> Option<(f64, f64)> {
     let (w, h) = (image.width as isize, image.height as isize);
     let radius = (4.0 * sigma).ceil() as isize;
     let inv_2s2 = 1.0 / (2.0 * sigma * sigma);
@@ -294,7 +374,7 @@ fn windowed_centroid(image: &Image, sky: f32, start: (f64, f64), sigma: f64) -> 
         let (step_x, step_y) = (2.0 * sdx / sw, 2.0 * sdy / sw);
         x += step_x;
         y += step_y;
-        if (x - start.0).hypot(y - start.1) > 2.0 {
+        if (x - start.0).hypot(y - start.1) > max_move {
             return None; // wandered off, e.g. towards a neighbour
         }
         if step_x.hypot(step_y) < 1e-5 {
@@ -500,6 +580,45 @@ mod tests {
                 "biased"
             );
             assert!(rms < max_rms, "rms {rms} for amplitude {amplitude}");
+        }
+    }
+    /// The centroid's error estimate matches its actual scatter, for a
+    /// bright and a faint source, starting from an off-centre click.
+    #[test]
+    fn centroid_error_is_calibrated() {
+        for &amplitude in &[2000.0, 120.0] {
+            let (mut sum_sq, mut pred, mut n) = (0.0, 0.0, 0.0);
+            for seed in 0..400u64 {
+                let mut rng = seed * 104_729 + 3;
+                let (tx, ty) = (
+                    24.0 + (seed % 10) as f64 * 0.1,
+                    24.3 + (seed % 7) as f64 * 0.11,
+                );
+                let (w, h) = (48, 48);
+                let data = (0..w * h)
+                    .map(|i| {
+                        let r2 = ((i % w) as f64 - tx).powi(2) + ((i / w) as f64 - ty).powi(2);
+                        (1000.0 + 10.0 * noise(&mut rng) as f64 + amplitude * (-r2 / 4.5).exp())
+                            as f32
+                    })
+                    .collect();
+                let image = Image {
+                    width: w,
+                    height: h,
+                    data,
+                    header: Header::default(),
+                };
+                let c = centroid(&image, (tx + 0.8, ty - 0.6), 1.5, 1000.0, 10.0, None).unwrap();
+                sum_sq += (c.x - tx).powi(2) + (c.y - ty).powi(2);
+                pred += c.sigma_x.powi(2) + c.sigma_y.powi(2);
+                n += 1.0;
+            }
+            let ratio = (sum_sq / pred).sqrt();
+            assert!(
+                (0.85..1.15).contains(&ratio),
+                "amplitude {amplitude}: actual/predicted {ratio}"
+            );
+            let _ = n;
         }
     }
 }

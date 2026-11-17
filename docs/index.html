@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>OpenCeres — open-source asteroid search</title>
-<meta name="description" content="A small, fast, open-source app for asteroid searching: blink survey images, spot moving objects, check known asteroids and write reports. For macOS, Windows and Linux.">
+<meta name="description" content="A small, fast, open-source app for asteroid searching: blink survey images, mark moving objects, check known asteroids and comets, and copy MPC reports measured against Gaia. For macOS, Windows and Linux.">
 <meta property="og:title" content="OpenCeres">
 <meta property="og:description" content="Small, fast, open-source asteroid search for macOS, Windows and Linux.">
 <meta property="og:image" content="https://alidevecioglu.github.io/OpenCeres/assets/icon-512.png">
@@ -121,7 +121,7 @@
   <header class="hero">
     <img class="icon" src="assets/icon-512.png" alt="OpenCeres icon: three amber dots rising across a navy square, the last one ringed">
     <h1>OpenCeres</h1>
-    <p class="lead">A small, fast, open-source app for asteroid searching. Blink your survey images, spot what moves, check known asteroids and send the report.</p>
+    <p class="lead">A small, fast, open-source app for asteroid searching. Blink your survey images, spot what moves, check known asteroids and comets, and copy an MPC report measured against Gaia.</p>
     <div class="download">
       <a class="btn" id="main-download" href="https://github.com/alidevecioglu/OpenCeres/releases/latest">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3v12m0 0-5-5m5 5 5-5M4 19h16"/></svg>
@@ -132,16 +132,16 @@
   </header>
 
   <div class="shot">
-    <img src="assets/screenshot-known.jpg" width="1600" height="1000" alt="OpenCeres showing a Pan-STARRS image with two known asteroids circled and listed in the side panel">
+    <img src="assets/screenshot-known.jpg" width="1600" height="1000" alt="OpenCeres showing a Pan-STARRS image with two marked moving objects matched to known asteroids, and the report ready in the side panel">
   </div>
 
   <section id="features">
     <h2>Made for search teams</h2>
-    <p class="sub">Built for students and amateur astronomers in campaigns such as IASC's, where teams blink Pan-STARRS images to discover new asteroids.</p>
+    <p class="sub">Built for search teams around the world in campaigns such as IASC's, where amateur astronomers and students blink Pan-STARRS images to discover new asteroids.</p>
     <div class="grid">
-      <div class="card"><div class="k">Blink</div><h3>Open a set, press play</h3><p>Drop in a folder or the .zip you were sent. Frames load in parallel and blink at the speed you choose.</p></div>
-      <div class="card"><div class="k">Known objects</div><h3>See what's already found</h3><p>Known asteroids in the field are circled with name, brightness and motion, online via SkyBoT or offline from MPCORB.</p></div>
-      <div class="card"><div class="k">Easy report</div><h3>Click the boxes, copy, send</h3><p>Turn on the grid and click each box where something moves. The row × column report is ready to paste for your teacher.</p></div>
+      <div class="card"><div class="k">Blink</div><h3>Open a set, press play</h3><p>Drop in a folder or the .zip you were sent. Frames load in parallel, align on the stars and blink at any speed from 0.1 to 5 s.</p></div>
+      <div class="card"><div class="k">Known objects</div><h3>Asteroids and comets</h3><p>Everything already known in the field is circled with name, brightness and motion, from the MPC catalogues on your computer (works offline) or online via SkyBoT.</p></div>
+      <div class="card"><div class="k">MPC report</div><h3>Measured against Gaia</h3><p>Click what moves on each frame. OpenCeres plate-solves every frame against Gaia DR3, measures position and magnitude, and builds the report to paste into your campaign's box.</p></div>
       <div class="card"><div class="k">Tiny</div><h3>A few megabytes</h3><p>Native code with no web engine inside. Starts instantly and uses almost no CPU while idle.</p></div>
       <div class="card"><div class="k">Everywhere</div><h3>Mac, Windows, Linux</h3><p>Runs natively on Apple Silicon and Intel Macs, Windows and Linux. No emulators or Wine needed.</p></div>
       <div class="card"><div class="k">Open</div><h3>Free and open source</h3><p>MIT or Apache-2.0. Read the code, check the maths and help improve it.</p></div>
@@ -151,11 +151,21 @@
   <section>
     <div class="two">
       <div>
-        <h2>From blink to report in a minute</h2>
-        <p class="sub">Pick a grid size, click the boxes where you saw movement, and copy a report like <code>XY57_p01: 2x3</code>. Boxes are counted from the top-left, the same way your team's charts are.</p>
-        <div class="status"><strong>Early development.</strong> Viewing, blinking, known objects and box reports work today. Automatic moving-object detection, plate solving against Gaia and MPC reports are on the way. Keep using your current software for official campaign measurements for now.</div>
+        <h2>From blink to MPC report</h2>
+        <p class="sub">Mark each moving object frame by frame; marks snap to the source and the next spot is predicted. The review window shows how well every frame fits Gaia, checks each object, and gives you the 80-column report with your team's header. One click copies it; save it as <code>.txt</code> or ADES too. Positions that come only from the image header are never offered for copying.</p>
+        <div class="status"><strong>In trial.</strong> On real IASC Pan-STARRS images the plate solutions fit to 0.02–0.03″ and known asteroids land within 0.15″ of their predicted places. Campaigns have not yet confirmed that they accept the reports, so run OpenCeres alongside your current software until they do.</div>
       </div>
-      <img src="assets/screenshot-report.jpg" width="1600" height="1000" loading="lazy" alt="OpenCeres with the 4×4 report grid on and box 2x3 selected">
+      <img src="assets/screenshot-report.jpg" width="1600" height="1000" loading="lazy" alt="The MPC report window: Gaia fits for each frame, the objects with their checks, and the 80-column report ready to copy">
+    </div>
+  </section>
+
+  <section>
+    <div class="two">
+      <div>
+        <h2>Ready in a few steps, in your language</h2>
+        <p class="sub">A short welcome on first launch sets the language, theme, your team's details and the offline catalogue. The interface is ready for translation, and adding a language needs no programming: <a href="https://github.com/alidevecioglu/OpenCeres/blob/main/TRANSLATING.md">help translate OpenCeres</a>.</p>
+      </div>
+      <img src="assets/screenshot-welcome.jpg" width="1600" height="1000" loading="lazy" alt="The OpenCeres welcome window on its last step, with three tips: blink with Space, click what moves, then review and copy the report">
     </div>
   </section>
 

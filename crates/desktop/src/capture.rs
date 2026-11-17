@@ -11,7 +11,8 @@
 //! (and never saves them), opens the paths given on the command line, waits
 //! until they have loaded and a few frames have been drawn, saves a PNG of
 //! its own window and exits. `OPENCERES_SCREENSHOT_STATE` is a comma list of:
-//! `light`, `dark`, `stars`, `invert`, `noalign` (frames as stored), `grid`, `panel`, `settings` (or
+//! `light`, `dark`, `stars`, `invert`, `noalign` (frames as stored), `grid`,
+//! `boxreport` (the box report feature on), `panel`, `settings` (or
 //! `settings=PAGE`, e.g. `settings=updates`), `search=TEXT` (in Settings),
 //! `update=VERSION` (pretend that version is available), `offers` (the box
 //! offering updates; use with `update=`), `help`, `history`
@@ -19,7 +20,8 @@
 //! screenshots leave the history alone unless `OPENCERES_HISTORY_DIR` gives
 //! them a folder), `paused`, `frame=N`
 //! (1-based), `mark=RxC` (row × column, repeatable), `gridsize=N`, `known`
-//! (look up known objects and wait for the answer), `focus=LABEL` (centre
+//! (look up known objects and wait for the answer), `knownopen` (open the
+//! panel's Known objects section), `focus=LABEL` (centre
 //! and zoom on that known object, where it is on the first frame),
 //! `objects=FILE` (a report's objects as the student's own), `marking`
 //! (continue marking the last of them), `report=FILE` (import a student's
@@ -28,7 +30,17 @@
 //! the Nth of the objects, 1-based), `clear` (the Clear button), `askgrid=N`
 //! (ask to change the grid to N), `snap=source|clicked` (last placement shown
 //! while marking), `expired` (a made-up team match whose session ended) and
-//! `size=WxH` (window size in points).
+//! `size=WxH` (window size in points). For the MPC report: `review` (open
+//! the review window; the screenshot waits for Gaia and the measurement)
+//! and `mpc=STATE` (show a made-up report state: `fetching`, `measuring`,
+//! `offline`, `failed`, `preview`, `missing` or `ready`). `speed` opens
+//! the blink speed popover; `speed=SECONDS` also sets the speed first.
+//! `onboarding` or `onboarding=STEP` shows the welcome window (which
+//! captures otherwise never show) at that step: 1–5 or `language`,
+//! `appearance`, `team`, `known`, `tips`. `details=FILE` reads sample team
+//! details (`report.txt` format) for the report header and `measured=NAME`
+//! sets the search's "Measured by" (needs `OPENCERES_HISTORY_DIR`).
+//! Values cannot contain commas.
 
 use eframe::egui;
 
@@ -39,6 +51,8 @@ pub struct State {
     pub invert: bool,
     pub no_align: bool,
     pub grid: bool,
+    /// Settings → Features → Box report turned on.
+    pub box_report: bool,
     pub panel: bool,
     pub settings: bool,
     pub settings_page: Option<String>,
@@ -50,6 +64,8 @@ pub struct State {
     pub history: Option<String>,
     pub paused: bool,
     pub known: bool,
+    /// The panel's Known objects section opened.
+    pub known_open: bool,
     pub focus: Option<String>,
     pub frame: Option<usize>,
     pub grid_size: Option<usize>,
@@ -65,6 +81,18 @@ pub struct State {
     pub ask_grid: Option<usize>,
     pub snap: Option<String>,
     pub expired: bool,
+    pub review: bool,
+    pub mpc: Option<String>,
+    /// The blink speed popover, and the speed to show in it.
+    pub speed_popover: bool,
+    pub speed: Option<f32>,
+    /// The welcome window at this step ("" = the first).
+    pub onboarding: Option<String>,
+    /// Team details for the report header from this file (`report.txt`
+    /// format), and the search's "Measured by", so screenshots of the
+    /// report can show sample details instead of the user's own.
+    pub details: Option<String>,
+    pub measured: Option<String>,
     pub size: Option<[f32; 2]>,
 }
 
@@ -114,6 +142,7 @@ impl State {
                 "invert" => s.invert = true,
                 "noalign" => s.no_align = true,
                 "grid" => s.grid = true,
+                "boxreport" => s.box_report = true,
                 "panel" => s.panel = true,
                 "settings" => {
                     s.settings = true;
@@ -126,6 +155,7 @@ impl State {
                 "history" => s.history = Some(value.to_owned()),
                 "paused" => s.paused = true,
                 "known" => s.known = true,
+                "knownopen" => s.known_open = true,
                 "focus" => s.focus = Some(value.to_owned()).filter(|v| !v.is_empty()),
                 "frame" => s.frame = value.parse().ok(),
                 "gridsize" => s.grid_size = value.parse().ok(),
@@ -140,6 +170,15 @@ impl State {
                 "askgrid" => s.ask_grid = value.parse().ok(),
                 "snap" => s.snap = Some(value.to_owned()),
                 "expired" => s.expired = true,
+                "review" => s.review = true,
+                "mpc" => s.mpc = Some(value.to_owned()).filter(|v| !v.is_empty()),
+                "speed" => {
+                    s.speed_popover = true;
+                    s.speed = value.parse().ok();
+                }
+                "onboarding" => s.onboarding = Some(value.to_owned()),
+                "details" => s.details = Some(value.to_owned()),
+                "measured" => s.measured = Some(value.to_owned()),
                 "size" => {
                     s.size = pair(value).map(|(w, h)| [w as f32, h as f32]);
                 }
@@ -170,7 +209,8 @@ mod tests {
     #[test]
     fn parses_state() {
         let s = State::parse(
-            "dark, grid,mark=2x1,mark=3x4,size=900x600,frame=2,known,focus=2026 RA34,bogus",
+            "dark, grid,mark=2x1,mark=3x4,size=900x600,frame=2,known,focus=2026 RA34,bogus,\
+             speed=1.35",
         );
         assert_eq!(s.theme, Some(egui::Theme::Dark));
         assert!(s.grid && !s.panel);
@@ -179,5 +219,7 @@ mod tests {
         assert_eq!(s.frame, Some(2));
         assert!(s.known);
         assert_eq!(s.focus.as_deref(), Some("2026 RA34"));
+        assert!(s.speed_popover);
+        assert_eq!(s.speed, Some(1.35));
     }
 }

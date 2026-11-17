@@ -11,9 +11,11 @@ use eframe::egui::{
 
 use super::{App, hline, muted_wrapped, paint_logo, segmented, shortcut_table};
 use crate::format;
+use crate::i18n;
 use crate::icons::{self, Icon};
 use crate::known::{self, Catalogue, Freshness};
 use crate::settings::{self, Category, Entry, Kind};
+use crate::speed;
 use crate::theme::{self, S1, S2, S3, S4, S5, palette};
 use crate::update;
 
@@ -89,7 +91,7 @@ impl App {
                 .layout(Layout::top_down(Align::Min)),
             |ui| {
                 ui.spacing_mut().item_spacing.y = 2.0;
-                for c in Category::ALL {
+                for c in Category::ALL.into_iter().filter(|c| c.visible(&self.prefs)) {
                     let selected = self.settings_search.is_empty() && c == self.settings_page;
                     if nav_item(ui, c, selected, narrow).clicked() {
                         self.settings_page = c;
@@ -195,7 +197,8 @@ impl App {
         let p = palette(ui);
         let query = self.settings_search.clone();
         let mut any = false;
-        for c in Category::ALL {
+        let prefs = self.prefs;
+        for c in Category::ALL.into_iter().filter(|c| c.visible(&prefs)) {
             let hits: Vec<&Entry> = settings::entries(c).filter(|e| e.matches(&query)).collect();
             if hits.is_empty() {
                 continue;
@@ -245,11 +248,15 @@ impl App {
     /// (below, when the page is narrow); custom rows draw underneath.
     fn settings_entry(&mut self, ui: &mut egui::Ui, e: &'static Entry) {
         let p = palette(ui);
+        // A translated label and description where the language has them.
+        let label = i18n::get(&format!("setting.{}", e.id)).unwrap_or(e.label);
+        let description =
+            i18n::get(&format!("setting.{}.description", e.id)).unwrap_or(e.description);
         let text = |ui: &mut egui::Ui| {
             ui.spacing_mut().item_spacing.y = 2.0;
-            ui.label(RichText::new(e.label).color(p.text));
-            if !e.description.is_empty() {
-                ui.add(Label::new(RichText::new(e.description).small().color(p.muted)).wrap());
+            ui.label(RichText::new(label).color(p.text));
+            if !description.is_empty() {
+                ui.add(Label::new(RichText::new(description).small().color(p.muted)).wrap());
             }
         };
         if let Kind::Custom(draw) = e.kind {
@@ -322,6 +329,18 @@ impl App {
                         set(&mut self.prefs, i);
                     }
                 }
+            }
+            Kind::Seconds { get, set } => {
+                let mut secs = get(&self.prefs);
+                ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                    ui.spacing_mut().item_spacing.x = S1;
+                    let field_w = 60.0;
+                    let a = speed::slider(ui, &mut secs, CONTROL - field_w - S1);
+                    let b = speed::field(ui, &mut secs);
+                    if a || b {
+                        set(&mut self.prefs, secs);
+                    }
+                });
             }
             Kind::Custom(_) => {}
         }
@@ -548,7 +567,22 @@ pub fn mpcorb(app: &mut App, ui: &mut egui::Ui) {
             *bytes as f64 / 1e6
         ),
     };
+    let comets = match info {
+        Catalogue::Present {
+            comets: Some(c), ..
+        } => Some(match c.modified {
+            Some(t) => format!("{} comets · orbits of {}", c.count, format::unix_utc(t)),
+            None => format!("{} comets", c.count),
+        }),
+        Catalogue::Present { comets: None, .. } => {
+            Some("Comets not downloaded yet — Update MPCORB adds them".to_owned())
+        }
+        Catalogue::Missing => None,
+    };
     ui.label(RichText::new(status).color(p.text));
+    if let Some(comets) = comets {
+        small(ui, comets, p.muted);
+    }
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = S2;
         app.download_controls(ui);
@@ -704,7 +738,7 @@ pub fn about(app: &mut App, ui: &mut egui::Ui) {
     );
     for line in [
         "SkyBoT — IMCCE, Observatoire de Paris",
-        "MPCORB orbit catalogue — Minor Planet Center",
+        "MPCORB and comet orbits — Minor Planet Center",
         "VSOP87 planetary theory — P. Bretagnon & G. Francou",
         "Planetary data — NASA JPL",
         "Typefaces — Inter (SIL OFL 1.1), Hack (MIT)",

@@ -4,15 +4,16 @@
 //! section" / "Reset all" put its values back to [`Prefs::default`].
 //!
 //! Adding a setting: add a field to [`Prefs`] (and its default), then one
-//! [`Entry`] here. A `Toggle` or `Choice` is saved under its `id`; a
+//! [`Entry`] here. A `Toggle`, `Choice` or `Seconds` is saved under its `id`; a
 //! `Custom` entry draws itself (status rows, buttons, tables) and is not
 //! saved by the registry.
 
 use eframe::egui;
 
-use crate::app::{App, history_ui, settings_ui, team_ui};
+use crate::app::{App, history_ui, mpc_ui, onboarding_ui, settings_ui, team_ui};
 use crate::icons::Icon;
-use crate::prefs::{GRID_SIZES, KnownSource, Prefs, SPEEDS, ThemeChoice};
+use crate::prefs::{GRID_SIZES, KnownSource, Prefs, ThemeChoice};
+use crate::speed;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Category {
@@ -20,6 +21,8 @@ pub enum Category {
     General,
     Appearance,
     Viewing,
+    Features,
+    Report,
     ReportGrid,
     Known,
     History,
@@ -30,10 +33,12 @@ pub enum Category {
 }
 
 impl Category {
-    pub const ALL: [Category; 10] = [
+    pub const ALL: [Category; 12] = [
         Category::General,
         Category::Appearance,
         Category::Viewing,
+        Category::Features,
+        Category::Report,
         Category::ReportGrid,
         Category::Known,
         Category::History,
@@ -48,6 +53,8 @@ impl Category {
             Category::General => "General",
             Category::Appearance => "Appearance",
             Category::Viewing => "Viewing",
+            Category::Features => "Features",
+            Category::Report => "Observer & report",
             Category::ReportGrid => "Report grid",
             Category::Known => "Known objects",
             Category::History => "History",
@@ -63,6 +70,8 @@ impl Category {
             Category::General => Icon::Gear,
             Category::Appearance => Icon::Theme,
             Category::Viewing => Icon::Eye,
+            Category::Features => Icon::Check,
+            Category::Report => Icon::Report,
             Category::ReportGrid => Icon::Grid,
             Category::Known => Icon::Known,
             Category::History => Icon::History,
@@ -71,6 +80,12 @@ impl Category {
             Category::Shortcuts => Icon::Keyboard,
             Category::About => Icon::Info,
         }
+    }
+
+    /// Whether the page is listed: the report grid's page only while the
+    /// box report is turned on.
+    pub fn visible(self, p: &Prefs) -> bool {
+        self != Category::ReportGrid || p.box_report
     }
 
     /// For `OPENCERES_SCREENSHOT_STATE=settings=<key>`: the label in lower
@@ -99,6 +114,12 @@ pub enum Kind {
         set: fn(&mut Prefs, usize),
         /// Numeric options: a value not in the list reads as the nearest one.
         nearest: bool,
+    },
+    /// A blink speed in seconds, any value in [`speed::MIN`]–[`speed::MAX`],
+    /// saved rounded to 0.01 s.
+    Seconds {
+        get: fn(&Prefs) -> f32,
+        set: fn(&mut Prefs, f32),
     },
     Custom(fn(&mut App, &mut egui::Ui)),
 }
@@ -146,16 +167,6 @@ const THEMES: [Opt; 3] = [
     opt("light", "Light"),
     opt("dark", "Dark"),
 ];
-const SPEED_OPTIONS: [Opt; 8] = [
-    opt("0.2", "0.2 s per frame"),
-    opt("0.3", "0.3 s per frame"),
-    opt("0.5", "0.5 s per frame"),
-    opt("0.75", "0.75 s per frame"),
-    opt("1", "1 s per frame"),
-    opt("1.5", "1.5 s per frame"),
-    opt("2", "2 s per frame"),
-    opt("3", "3 s per frame"),
-];
 const GRID_OPTIONS: [Opt; 5] = [
     opt("3", "3×3"),
     opt("4", "4×4"),
@@ -163,7 +174,20 @@ const GRID_OPTIONS: [Opt; 5] = [
     opt("6", "6×6"),
     opt("8", "8×8"),
 ];
-const SOURCES: [Opt; 2] = [opt("skybot", "SkyBoT"), opt("mpcorb", "MPCORB")];
+const SOURCES: [Opt; 3] = [
+    opt("auto", "Automatic"),
+    opt("skybot", "SkyBoT"),
+    opt("mpcorb", "MPCORB"),
+];
+/// Automatic, then [`openceres_core::gaia::MIRRORS`] in order.
+const MIRROR_OPTIONS: [Opt; 6] = [
+    opt("auto", "Automatic"),
+    opt("cds", "CDS Strasbourg"),
+    opt("cfa", "CfA Harvard"),
+    opt("idia", "IDIA Cape Town"),
+    opt("naoj", "NAOJ Tokyo"),
+    opt("china-vo", "China-VO Beijing"),
+];
 
 fn index_of<T: PartialEq>(all: &[T], value: &T) -> usize {
     all.iter().position(|v| v == value).unwrap_or(0)
@@ -171,6 +195,22 @@ fn index_of<T: PartialEq>(all: &[T], value: &T) -> usize {
 
 pub static ENTRIES: &[Entry] = &[
     // General
+    Entry {
+        id: "language",
+        category: Category::General,
+        label: "Language",
+        description: "The language of OpenCeres's windows.",
+        keywords: "language translation translate locale english",
+        kind: Kind::Custom(onboarding_ui::language_setting),
+    },
+    Entry {
+        id: "welcome",
+        category: Category::General,
+        label: "Welcome window",
+        description: "The short tour shown the first time OpenCeres starts.",
+        keywords: "welcome onboarding first run tour introduction tips start",
+        kind: Kind::Custom(onboarding_ui::welcome_setting),
+    },
     Entry {
         id: "data_folder",
         category: Category::General,
@@ -206,13 +246,14 @@ pub static ENTRIES: &[Entry] = &[
         id: "blink_seconds",
         category: Category::Viewing,
         label: "Blink speed",
-        description: "How long each frame is shown. , and . change it for now.",
-        keywords: "speed seconds frame rate interval slower faster animation",
-        kind: Kind::Choice {
-            options: &SPEED_OPTIONS,
-            get: |p| index_of(&SPEEDS, &p.blink_seconds),
-            set: |p, i| p.blink_seconds = SPEEDS[i],
-            nearest: true,
+        description: "Seconds each frame is shown when a set opens, 0.10 to 5.00. \
+                      In the toolbar, drag or click the value, or press , and . \
+                      (Shift for bigger steps) to change it for now.",
+        keywords: "speed seconds frame rate interval slower faster animation tortoise hare \
+                   slider",
+        kind: Kind::Seconds {
+            get: |p| p.blink_seconds,
+            set: |p, v| p.blink_seconds = v,
         },
     },
     Entry {
@@ -250,6 +291,93 @@ pub static ENTRIES: &[Entry] = &[
             get: |p| p.align,
             set: |p, v| p.align = v,
         },
+    },
+    // Features
+    Entry {
+        id: "box_report",
+        category: Category::Features,
+        label: "Box report",
+        description: "The older way to report: a grid over the image, and you click \
+                      each box where something moves. Turning it on adds the grid \
+                      button (G), the Easy report in the side panel and the Report \
+                      grid settings.",
+        keywords: "grid boxes easy report simple 1x1 old legacy feature enable",
+        kind: Kind::Toggle {
+            get: |p| p.box_report,
+            set: |p, v| p.box_report = v,
+        },
+    },
+    // Observer & report
+    Entry {
+        id: "report_code",
+        category: Category::Report,
+        label: "Observatory code",
+        description: "The MPC code of the telescope that took the images. Leave it empty \
+                      to take it from the images (F51 for Pan-STARRS 1).",
+        keywords: "mpc cod observatory code station site f51 pan-starrs",
+        kind: Kind::Custom(mpc_ui::code_setting),
+    },
+    Entry {
+        id: "report_observers",
+        category: Category::Report,
+        label: "Observers",
+        description: "Who took the images, as initials and surname, separated by commas \
+                      (e.g. “J. R. Smith, A. Jones”). Ask your campaign what to put here.",
+        keywords: "obs observers names initials surname team campaign",
+        kind: Kind::Custom(mpc_ui::observers_setting),
+    },
+    Entry {
+        id: "history_name",
+        category: Category::Report,
+        label: "Measured by",
+        description: "Filled in for new searches. Each search keeps its own (in the side \
+                      panel and the report), so on a shared computer everyone can type theirs.",
+        keywords: "mea measurer student name searched by your name person profile",
+        kind: Kind::Custom(history_ui::name_setting),
+    },
+    Entry {
+        id: "report_contact",
+        category: Category::Report,
+        label: "Contact",
+        description: "One person the MPC can write to: name, address and e-mail.",
+        keywords: "con contact email address teacher leader",
+        kind: Kind::Custom(mpc_ui::contact_setting),
+    },
+    Entry {
+        id: "report_telescope",
+        category: Category::Report,
+        label: "Telescope",
+        description: "Aperture, focal ratio, design and detector (no camera brands). \
+                      Pan-STARRS 1: 1.8 m, f/4.4, Ritchey-Chretien, CCD.",
+        keywords: "tel telescope aperture focal ratio design ccd detector",
+        kind: Kind::Custom(mpc_ui::telescope_setting),
+    },
+    Entry {
+        id: "report_designations",
+        category: Category::Report,
+        label: "Designation prefix",
+        description: "New objects are named with this and a number, e.g. OC0001. Letters \
+                      and digits, starting with a letter; agree on one per team so names \
+                      don't repeat.",
+        keywords: "temporary designation prefix name number tracklet trksub",
+        kind: Kind::Custom(mpc_ui::prefix_setting),
+    },
+    Entry {
+        id: "report_ack",
+        category: Category::Report,
+        label: "Acknowledgement",
+        description: "Text the MPC e-mails back when it receives the report (ACK), and \
+                      where to (AC2). Optional.",
+        keywords: "ack ac2 acknowledgement receipt email batch",
+        kind: Kind::Custom(mpc_ui::ack_setting),
+    },
+    Entry {
+        id: "report_header",
+        category: Category::Report,
+        label: "Report header",
+        description: "The first lines of every report, as they will be sent.",
+        keywords: "header preview cod obs mea tel net lines",
+        kind: Kind::Custom(mpc_ui::header_preview),
     },
     // Report grid
     Entry {
@@ -304,8 +432,9 @@ pub static ENTRIES: &[Entry] = &[
         category: Category::Known,
         label: "Source",
         description: "SkyBoT asks IMCCE's service online. MPCORB searches the Minor \
-                      Planet Center's catalogue on this computer once downloaded.",
-        keywords: "skybot mpcorb online offline asteroids comets lookup imcce mpc",
+                      Planet Center's asteroid and comet orbits on this computer once \
+                      downloaded. Automatic uses MPCORB when it is here, else SkyBoT.",
+        keywords: "skybot mpcorb automatic online offline asteroids comets lookup imcce mpc",
         kind: Kind::Choice {
             options: &SOURCES,
             get: |p| index_of(&KnownSource::ALL, &p.known_source),
@@ -317,21 +446,36 @@ pub static ENTRIES: &[Entry] = &[
         id: "mpcorb",
         category: Category::Known,
         label: "MPCORB catalogue",
-        description: "About 94 MB from the Minor Planet Center. Check for update asks \
-                      the server without downloading.",
-        keywords: "download update catalogue catalog offline orbit database mpc check",
+        description: "About 94 MB from the Minor Planet Center, with its comet orbits \
+                      (CometEls.txt). Check for update asks the server without downloading.",
+        keywords: "download update catalogue catalog offline orbit database mpc check \
+                   comets cometels",
         kind: Kind::Custom(settings_ui::mpcorb),
     },
-    // History
     Entry {
-        id: "history_name",
-        category: Category::History,
-        label: "Your name",
-        description: "Filled in as “Searched by” on new searches. On a shared computer, \
-                      each student can type their own name in the side panel instead.",
-        keywords: "student name searched by observer person profile",
-        kind: Kind::Custom(history_ui::name_setting),
+        id: "gaia_mirror",
+        category: Category::Known,
+        label: "Gaia star catalogue",
+        description: "Reports are measured against Gaia DR3 stars from VizieR. \
+                      Automatic tries the mirror that last worked, then the others.",
+        keywords: "gaia vizier mirror server catalogue catalog plate solution astrometry \
+                   cds cfa idia naoj china",
+        kind: Kind::Choice {
+            options: &MIRROR_OPTIONS,
+            get: |p| p.gaia_mirror.min(MIRROR_OPTIONS.len() - 1),
+            set: |p, i| p.gaia_mirror = i,
+            nearest: false,
+        },
     },
+    Entry {
+        id: "gaia_status",
+        category: Category::Known,
+        label: "VizieR mirrors",
+        description: "Test all asks each mirror for a few stars.",
+        keywords: "gaia vizier mirror test status retest online offline",
+        kind: Kind::Custom(mpc_ui::mirror_status),
+    },
+    // History
     Entry {
         id: "history_folder",
         category: Category::History,
@@ -429,6 +573,7 @@ pub fn reset(prefs: &mut Prefs, category: Option<Category>) {
         match e.kind {
             Kind::Toggle { get, set } => set(prefs, get(&default)),
             Kind::Choice { get, set, .. } => set(prefs, get(&default)),
+            Kind::Seconds { get, set } => set(prefs, get(&default)),
             Kind::Custom(_) => {}
         }
     }
@@ -440,6 +585,7 @@ pub fn is_changed(prefs: &Prefs, category: Category) -> bool {
     entries(category).any(|e| match e.kind {
         Kind::Toggle { get, .. } => get(prefs) != get(&default),
         Kind::Choice { get, .. } => get(prefs) != get(&default),
+        Kind::Seconds { get, .. } => get(prefs) != get(&default),
         Kind::Custom(_) => false,
     })
 }
@@ -477,6 +623,11 @@ pub fn read(prefs: &mut Prefs, key: &str, value: &str) -> bool {
                 set(prefs, i);
             }
         }
+        Kind::Seconds { set, .. } => {
+            if let Some(v) = value.parse::<f32>().ok().filter(|v| v.is_finite()) {
+                set(prefs, speed::tidy(v));
+            }
+        }
         Kind::Custom(_) => {}
     }
     true
@@ -489,6 +640,9 @@ pub fn write(prefs: &Prefs, out: &mut String) {
             Kind::Toggle { get, .. } => *out += &format!("{}={}\n", e.id, get(prefs)),
             Kind::Choice { options, get, .. } => {
                 *out += &format!("{}={}\n", e.id, options[get(prefs)].key);
+            }
+            Kind::Seconds { get, .. } => {
+                *out += &format!("{}={}\n", e.id, speed::tidy(get(prefs)));
             }
             Kind::Custom(_) => {}
         }
@@ -508,10 +662,6 @@ mod tests {
                 e.id
             );
         }
-        for (s, o) in SPEEDS.iter().zip(&SPEED_OPTIONS) {
-            assert_eq!(s.to_string(), o.key);
-        }
-        assert_eq!(SPEEDS.len(), SPEED_OPTIONS.len());
         for (n, o) in GRID_SIZES.iter().zip(&GRID_OPTIONS) {
             assert_eq!(n.to_string(), o.key);
         }
@@ -519,6 +669,19 @@ mod tests {
         for c in Category::ALL {
             assert!(entries(c).next().is_some(), "{c:?} is empty");
             assert_eq!(Category::from_key(&c.label().replace(' ', "")), Some(c));
+        }
+    }
+
+    /// A `setting.<id>` text in en.txt is the registry's own English, which
+    /// the search uses (see `settings_ui`).
+    #[test]
+    fn translated_labels_match_the_registry() {
+        crate::i18n::set_language("en");
+        for e in ENTRIES {
+            let label = crate::i18n::get(&format!("setting.{}", e.id));
+            assert!(label.is_none_or(|l| l == e.label), "{}", e.id);
+            let description = crate::i18n::get(&format!("setting.{}.description", e.id));
+            assert!(description.is_none_or(|d| d == e.description), "{}", e.id);
         }
     }
 
@@ -550,6 +713,11 @@ mod tests {
         reset(&mut p, Some(Category::Viewing));
         assert!(!p.invert && !is_changed(&p, Category::Viewing));
         assert_eq!((p.theme, p.grid_size), (ThemeChoice::Dark, 8));
+        // A blink speed off the old list counts as changed and resets too.
+        p.blink_seconds = 2.35;
+        assert!(is_changed(&p, Category::Viewing));
+        reset(&mut p, Some(Category::Viewing));
+        assert_eq!(p.blink_seconds, Prefs::default().blink_seconds);
         reset(&mut p, None);
         assert_eq!(p, Prefs::default());
     }

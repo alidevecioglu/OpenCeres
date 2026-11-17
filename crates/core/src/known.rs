@@ -1,16 +1,16 @@
 //! Known solar-system objects in a field: online from IMCCE's SkyBoT service
 //! (<https://ssp.imcce.fr/webservices/skybot/>), or offline from the MPC's
-//! MPCORB orbit catalogue.
+//! MPCORB orbit catalogue and its comet orbits (`CometEls.txt`).
 //!
 //! For SkyBoT the core only builds the request and parses the reply; fetching
-//! is up to the caller, so this module stays dependency-free. For MPCORB the
-//! caller supplies the (decompressed) file as a reader.
+//! is up to the caller, so this module stays dependency-free. For the MPC
+//! files the caller supplies the (decompressed) file as a reader.
 
 use std::io::BufRead;
 
 use crate::ephem;
 use crate::fits::Header;
-use crate::orbit::{self, Elements, State};
+use crate::orbit::{self, Conic, Elements, State};
 use crate::time::{self, CalendarDate};
 
 const SKYBOT: &str = "https://ssp.imcce.fr/webservices/skybot/api/conesearch.php";
@@ -182,78 +182,201 @@ const MOTION_STEP: f64 = 30.0 / 1440.0;
 /// The file is streamed line by line; memory use is independent of its
 /// size. Unreadable lines (the header, blank separators, hyperbolic orbits)
 /// are skipped.
-pub fn mpcorb_search(
-    mut reader: impl BufRead,
-    query: &FieldQuery,
-) -> Result<Vec<KnownObject>, String> {
-    let site = match query.observatory.as_deref() {
-        Some(code) => Some(
-            ephem::observatory(code).ok_or_else(|| format!("unknown observatory code {code:?}"))?,
-        ),
-        None => None,
-    };
-    let jds = [query.jd - MOTION_STEP, query.jd, query.jd + MOTION_STEP];
-    let observers = jds.map(|jd| ephem::observer(site.as_ref(), jd));
-    let centre = ephem::unit(query.ra, query.dec);
-    let cos_radius = query.radius.min(180.0).to_radians().cos();
-    let t = ephem::tt_from_utc(query.jd);
-
+pub fn mpcorb_search(reader: impl BufRead, query: &FieldQuery) -> Result<Vec<KnownObject>, String> {
+    let sight = Sight::new(query)?;
     let mut found = Vec::new();
+    for_each_line(reader, "MPCORB", |line| {
+        let Some(elements) = parse_elements(line) else {
+            return;
+        };
+        let margin = prefilter_margin((sight.t - elements.epoch).abs() / 365.25);
+        if !sight.near(elements.position(sight.t), margin) {
+            return;
+        }
+        let Some(state) = orbit::propagate(&elements, sight.t) else {
+            return;
+        };
+        let Some(seen) = sight.locate(&state) else {
+            return;
+        };
+        let Some(record) = parse_record(line) else {
+            return;
+        };
+        found.push(KnownObject {
+            number: record.number,
+            name: record.name,
+            ra: seen.ra,
+            dec: seen.dec,
+            class: classify(&elements).to_string(),
+            magnitude: record
+                .h
+                .map(|h| magnitude(h, record.g, seen.r, seen.delta, seen.sun_observer)),
+            uncertainty: record.u.map_or(0.0, uncertainty_from_u),
+            motion_ra: seen.motion_ra,
+            motion_dec: seen.motion_dec,
+        });
+    })?;
+    Ok(found)
+}
+
+/// Searches the MPC's comet orbits (`CometEls.txt`, the one-line format of
+/// "Export Format for Comet Orbits" also used in `Soft00Cmt.txt`) for comets
+/// within `query.radius` of the field centre at `query.jd`, in the same
+/// astrometric convention as [`mpcorb_search`]. Class is `Comet`.
+///
+/// Orbits with an epoch are osculating there and are integrated with the
+/// planets' perturbations from it; orbits without one are unperturbed
+/// solutions and move on their two-body conic. Comets' non-gravitational
+/// forces (outgassing) are not modelled: like the MPC's own one-line
+/// elements, positions can be off by arcseconds to arcminutes for active
+/// comets far from the epoch. Magnitudes are total (coma) magnitudes,
+/// m = M1 + 5 log Δ + 2.5·K·log r, with M1 and K from the absolute magnitude
+/// and slope columns; nuclear magnitudes can be much fainter. The orbit
+/// files give no uncertainty, so it is 0.
+pub fn comet_search(reader: impl BufRead, query: &FieldQuery) -> Result<Vec<KnownObject>, String> {
+    let sight = Sight::new(query)?;
+    let mut found = Vec::new();
+    for_each_line(reader, "the comet orbits", |line| {
+        let Some(comet) = parse_comet(line) else {
+            return;
+        };
+        let years = (sight.t - comet.epoch.unwrap_or(comet.orbit.perihelion_time)).abs() / 365.25;
+        // Comets pass close to the Earth more often than main-belt asteroids,
+        // where a small position error is a large angle: at least 1°.
+        let margin = prefilter_margin(years).max(1.0);
+        if !sight.near(comet.orbit.state(sight.t).0, margin) {
+            return;
+        }
+        let state = match comet.epoch {
+            Some(epoch) => orbit::integrate(comet.orbit.state(epoch), epoch, sight.t),
+            None => Some(State::two_body(comet.orbit.state(sight.t), sight.t)),
+        };
+        let Some(seen) = state.as_ref().and_then(|s| sight.locate(s)) else {
+            return;
+        };
+        found.push(KnownObject {
+            number: comet.designation,
+            name: comet.name,
+            ra: seen.ra,
+            dec: seen.dec,
+            class: "Comet".into(),
+            magnitude: comet
+                .m1
+                .map(|m1| comet_magnitude(m1, comet.k, seen.r, seen.delta)),
+            uncertainty: 0.0,
+            motion_ra: seen.motion_ra,
+            motion_dec: seen.motion_dec,
+        });
+    })?;
+    Ok(found)
+}
+
+/// Number of readable comet orbits in a `CometEls.txt`-format file; 0 for
+/// anything else (an error page, a truncated download).
+pub fn comet_count(reader: impl BufRead) -> usize {
+    let mut n = 0;
+    let _ = for_each_line(reader, "the comet orbits", |line| {
+        n += parse_comet(line).is_some() as usize;
+    });
+    n
+}
+
+/// Calls `each` with every line of `reader` (without allocating per line).
+fn for_each_line(
+    mut reader: impl BufRead,
+    what: &str,
+    mut each: impl FnMut(&[u8]),
+) -> Result<(), String> {
     let mut line = Vec::with_capacity(256);
     loop {
         line.clear();
         if reader
             .read_until(b'\n', &mut line)
-            .map_err(|e| format!("reading MPCORB: {e}"))?
+            .map_err(|e| format!("reading {what}: {e}"))?
             == 0
         {
-            break;
+            return Ok(());
         }
-        let Some(elements) = parse_elements(&line) else {
-            continue;
+        each(&line);
+    }
+}
+
+/// The observer's side of a field search: where they are at the query time
+/// and half an hour either side (for the motion), and the field.
+struct Sight {
+    /// Query time, JD (TT).
+    t: f64,
+    jds: [f64; 3],
+    observers: [[f64; 3]; 3],
+    centre: [f64; 3],
+    radius: f64,
+    cos_radius: f64,
+}
+
+/// Where an object appears from the observer.
+struct Seen {
+    ra: f64,
+    dec: f64,
+    /// Arcseconds per hour, RA already × cos Dec.
+    motion_ra: f64,
+    motion_dec: f64,
+    /// Sun–object, observer–object and Sun–observer distances, au.
+    r: f64,
+    delta: f64,
+    sun_observer: f64,
+}
+
+impl Sight {
+    fn new(query: &FieldQuery) -> Result<Sight, String> {
+        let site = match query.observatory.as_deref() {
+            Some(code) => Some(
+                ephem::observatory(code)
+                    .ok_or_else(|| format!("unknown observatory code {code:?}"))?,
+            ),
+            None => None,
         };
-        // Cheap pass: two-body geometric position, no light time.
-        let rough = ephem::sub(heliocentric(&elements, t), observers[1]);
-        let margin = prefilter_margin((t - elements.epoch).abs() / 365.25);
-        let cos_rough = (query.radius + margin).min(180.0).to_radians().cos();
-        if dot(rough, centre) < cos_rough * ephem::norm(rough) {
-            continue;
+        let jds = [query.jd - MOTION_STEP, query.jd, query.jd + MOTION_STEP];
+        Ok(Sight {
+            t: ephem::tt_from_utc(query.jd),
+            jds,
+            observers: jds.map(|jd| ephem::observer(site.as_ref(), jd)),
+            centre: ephem::unit(query.ra, query.dec),
+            radius: query.radius,
+            cos_radius: query.radius.min(180.0).to_radians().cos(),
+        })
+    }
+
+    /// The cheap first pass: whether a heliocentric ecliptic position (two
+    /// body, no light time) is within the radius plus `margin` degrees.
+    fn near(&self, ecliptic: [f64; 3], margin: f64) -> bool {
+        let rough = ephem::sub(ephem::ecliptic_to_equatorial(ecliptic), self.observers[1]);
+        let cos_rough = (self.radius + margin).min(180.0).to_radians().cos();
+        dot(rough, self.centre) >= cos_rough * ephem::norm(rough)
+    }
+
+    /// The object's astrometric place and motion, if it is in the field.
+    fn locate(&self, state: &State) -> Option<Seen> {
+        let here = astrometric(state, self.t, self.observers[1]);
+        if dot(here.topocentric, self.centre) < self.cos_radius * here.distance {
+            return None;
         }
-        let Some(state) = orbit::propagate(&elements, t) else {
-            continue;
-        };
-        let here = astrometric(&state, t, observers[1]);
-        if dot(here.topocentric, centre) < cos_radius * here.distance {
-            continue;
-        }
-        let Some(record) = parse_record(&line) else {
-            continue;
-        };
-        let before = astrometric(&state, ephem::tt_from_utc(jds[0]), observers[0]);
-        let after = astrometric(&state, ephem::tt_from_utc(jds[2]), observers[2]);
+        let before = astrometric(state, ephem::tt_from_utc(self.jds[0]), self.observers[0]);
+        let after = astrometric(state, ephem::tt_from_utc(self.jds[2]), self.observers[2]);
         let (ra, dec) = ephem::ra_dec(here.topocentric);
         let (ra0, dec0) = ephem::ra_dec(before.topocentric);
         let (ra1, dec1) = ephem::ra_dec(after.topocentric);
         let hours = 2.0 * MOTION_STEP * 24.0;
         let dra = ((ra1 - ra0 + 540.0).rem_euclid(360.0) - 180.0) * dec.to_radians().cos();
-
-        let r = ephem::norm(here.heliocentric);
-        let sun_observer = ephem::norm(observers[1]);
-        found.push(KnownObject {
-            number: record.number,
-            name: record.name,
+        Some(Seen {
             ra,
             dec,
-            class: classify(&elements).to_string(),
-            magnitude: record
-                .h
-                .map(|h| magnitude(h, record.g, r, here.distance, sun_observer)),
-            uncertainty: record.u.map_or(0.0, uncertainty_from_u),
             motion_ra: dra * 3600.0 / hours,
             motion_dec: (dec1 - dec0) * 3600.0 / hours,
-        });
+            r: ephem::norm(here.heliocentric),
+            delta: here.distance,
+            sun_observer: ephem::norm(self.observers[1]),
+        })
     }
-    Ok(found)
 }
 
 /// Date of an MPCORB file for display, e.g. `"2026-10-28"`.
@@ -292,10 +415,6 @@ struct Astrometric {
     distance: f64,
 }
 
-fn heliocentric(elements: &Elements, jd_tt: f64) -> [f64; 3] {
-    ephem::ecliptic_to_equatorial(elements.position(jd_tt))
-}
-
 /// Position seen by an observer at `observer` (heliocentric) at `jd_tt`,
 /// corrected for light time: the object is where it was Δ/c earlier. Three
 /// passes converge to microseconds.
@@ -330,6 +449,94 @@ fn magnitude(h: f64, g: f64, r: f64, delta: f64, sun_observer: f64) -> f64 {
     let phi2 = (-1.87 * tan_half.powf(1.22)).exp();
     let phase = ((1.0 - g) * phi1 + g * phi2).max(1e-12);
     h + 5.0 * (r * delta).log10() - 2.5 * phase.log10()
+}
+
+/// Total magnitude of a comet: m = M1 + 5 log Δ + 2.5·K·log r, the law
+/// behind the MPC's comet "absolute magnitude" and "slope parameter"
+/// columns (the same pair the MPC exports as XEphem's g, k model).
+fn comet_magnitude(m1: f64, k: f64, r: f64, delta: f64) -> f64 {
+    m1 + 5.0 * delta.log10() + 2.5 * k * r.log10()
+}
+
+/// A comet line of `CometEls.txt`.
+#[derive(Debug, Clone, PartialEq)]
+struct Comet {
+    orbit: Conic,
+    /// Osculation epoch, JD (TT); `None` for an unperturbed solution.
+    epoch: Option<f64>,
+    m1: Option<f64>,
+    k: f64,
+    /// Short designation such as `4P`, `C/2026 B2` or `3D-A`, when the
+    /// comet also has a name.
+    designation: Option<String>,
+    /// The name (`Faye`, `Sun-Gao`), else the designation.
+    name: String,
+}
+
+/// Parses a line in the MPC's one-line comet format ("Export Format for
+/// Comet Orbits", second table; columns 15–100 and 103–158). `None` for
+/// anything else.
+fn parse_comet(line: &[u8]) -> Option<Comet> {
+    let year: i32 = text(line, 14, 18)?.parse().ok()?;
+    let month: u32 = text(line, 19, 21)?.parse().ok()?;
+    let day = float(line, 22, 29)?;
+    let orbit = Conic {
+        perihelion_time: time::calendar_to_jd(CalendarDate { year, month, day }),
+        perihelion_distance: float(line, 30, 39)?,
+        eccentricity: float(line, 41, 49)?,
+        perihelion: float(line, 51, 59)?,
+        node: float(line, 61, 69)?,
+        inclination: float(line, 71, 79)?,
+    };
+    let ok = (1..=12).contains(&month)
+        && orbit.perihelion_distance > 0.0
+        && orbit.eccentricity >= 0.0
+        && orbit.perihelion_time.is_finite();
+    if !ok {
+        return None;
+    }
+    let epoch = match text(line, 81, 89) {
+        Some("") | None => None,
+        Some(e) => {
+            let ymd: u32 = e.parse().ok()?;
+            let (month, day) = (ymd / 100 % 100, ymd % 100);
+            if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+                return None;
+            }
+            Some(time::calendar_to_jd(CalendarDate {
+                year: (ymd / 10_000) as i32,
+                month,
+                day: day as f64,
+            }))
+        }
+    };
+    let (designation, name) = comet_name(text(line, 102, 158).filter(|s| !s.is_empty())?);
+    Some(Comet {
+        orbit,
+        epoch,
+        m1: float(line, 91, 95),
+        k: float(line, 96, 100).unwrap_or(4.0),
+        designation,
+        name,
+    })
+}
+
+/// Splits the designation-and-name column: `4P/Faye` → (`4P`, `Faye`),
+/// `C/2026 B2 (Sun-Gao)` → (`C/2026 B2`, `Sun-Gao`), and a bare
+/// designation `C/2026 X1` → (none, `C/2026 X1`).
+fn comet_name(full: &str) -> (Option<String>, String) {
+    if let Some((designation, rest)) = full.split_once(" (") {
+        let name = rest.strip_suffix(')').unwrap_or(rest);
+        return (Some(designation.to_owned()), name.to_owned());
+    }
+    // Numbered: digits, then the type letter (and a fragment), then '/'.
+    if let Some((designation, name)) = full.split_once('/')
+        && designation.starts_with(|c: char| c.is_ascii_digit())
+        && !name.is_empty()
+    {
+        return (Some(designation.to_owned()), name.to_owned());
+    }
+    (None, full.to_owned())
 }
 
 /// The MPC's U parameter as an angle: the upper end of its in-orbit
@@ -789,5 +996,340 @@ mod tests {
         );
         assert_eq!(mpcorb_date(text.as_bytes()).as_deref(), Some("2026-10-26"));
         assert_eq!(mpcorb_date(&b"no orbits here\n"[..]), None);
+    }
+
+    /// A comet line in the documented fixed columns ("Export Format for
+    /// Comet Orbits", one-line table): perihelion time in TT as a calendar
+    /// date, epoch as YYYYMMDD (blank if none).
+    fn comet_line(
+        packed: &str,
+        c: &Conic,
+        epoch: Option<u32>,
+        hk: (f64, f64),
+        name: &str,
+    ) -> String {
+        let t = time::jd_to_calendar(c.perihelion_time);
+        let epoch = epoch.map_or(String::new(), |e| e.to_string());
+        let line = format!(
+            "{packed:<12}  {:4} {:02} {:7.4} {:9.6}  {:8.6}  {:8.4}  {:8.4}  {:8.4}  {epoch:>8}  {:4.1} {:4.1}  {name:<56} {:<9}",
+            t.year,
+            t.month,
+            t.day,
+            c.perihelion_distance,
+            c.eccentricity,
+            c.perihelion,
+            c.node,
+            c.inclination,
+            hk.0,
+            hk.1,
+            "MPC 12345",
+        );
+        assert_eq!(line.len(), 168, "{line}");
+        line
+    }
+
+    fn sample_comet() -> Conic {
+        Conic {
+            perihelion_time: time::calendar_to_jd(CalendarDate {
+                year: 2026,
+                month: 12,
+                day: 22.3548,
+            }),
+            perihelion_distance: 1.93777,
+            eccentricity: 0.997665,
+            perihelion: 155.939,
+            node: 206.5873,
+            inclination: 82.3062,
+        }
+    }
+
+    #[test]
+    fn parses_comet_lines() {
+        let c = sample_comet();
+        let line = comet_line(
+            "    CK26A020",
+            &c,
+            Some(20261116),
+            (11.0, 4.0),
+            "C/2026 A2 (Bok)",
+        );
+        // The documented columns: year 15–18, q 31–39, e 42–49, epoch 82–89.
+        assert_eq!(&line[14..18], "2026");
+        assert_eq!(&line[30..39], " 1.937770");
+        assert_eq!(&line[81..89], "20261116");
+        let parsed = parse_comet(line.as_bytes()).unwrap();
+        assert!((parsed.orbit.perihelion_time - c.perihelion_time).abs() < 1e-6);
+        assert_eq!(
+            Conic {
+                perihelion_time: c.perihelion_time,
+                ..parsed.orbit
+            },
+            c
+        );
+        assert_eq!(
+            parsed.epoch,
+            Some(time::calendar_to_jd(CalendarDate {
+                year: 2026,
+                month: 11,
+                day: 16.0
+            }))
+        );
+        assert_eq!((parsed.m1, parsed.k), (Some(11.0), 4.0));
+        assert_eq!(
+            (parsed.designation.as_deref(), parsed.name.as_str()),
+            (Some("C/2026 A2"), "Bok")
+        );
+
+        // Numbered and fragment designations; no epoch (unperturbed).
+        let numbered = comet_line("0004P", &c, None, (11.4, 4.0), "4P/Faye");
+        let parsed = parse_comet(numbered.as_bytes()).unwrap();
+        assert_eq!(parsed.epoch, None);
+        assert_eq!(
+            (parsed.designation.as_deref(), parsed.name.as_str()),
+            (Some("4P"), "Faye")
+        );
+        assert_eq!(
+            comet_name("3D-A/Biela"),
+            (Some("3D-A".into()), "Biela".into())
+        );
+        assert_eq!(
+            comet_name("1I/`Oumuamua"),
+            (Some("1I".into()), "`Oumuamua".into())
+        );
+        assert_eq!(comet_name("C/2026 X1"), (None, "C/2026 X1".into()));
+
+        // Hyperbolic orbits are read too; asteroid lines and junk are not.
+        let hyperbolic = Conic {
+            eccentricity: 1.002742,
+            ..c
+        };
+        let line = comet_line(
+            "    CK26A030",
+            &hyperbolic,
+            Some(20261116),
+            (12.1, 4.0),
+            "C/2026 A3 (PANSTARRS)",
+        );
+        assert_eq!(
+            parse_comet(line.as_bytes()).unwrap().orbit.eccentricity,
+            1.002742
+        );
+        let asteroid = mpcorb_line("D3105", "(133105) 2003 OG10", &sample_orbit(), "K2669", '0');
+        assert!(parse_comet(asteroid.as_bytes()).is_none());
+        assert!(parse_comet(b"").is_none());
+        assert!(parse_comet(&[b' '; 168]).is_none());
+    }
+
+    #[test]
+    fn comet_magnitude_law() {
+        // m = M1 + 5 log Δ + 2.5·K·log r: at r = Δ = 1 au it is M1; with
+        // K = 4 (the usual default, K1 = 10) r = 10 au adds 10 mag.
+        assert_eq!(comet_magnitude(11.0, 4.0, 1.0, 1.0), 11.0);
+        assert!((comet_magnitude(11.0, 4.0, 10.0, 1.0) - 21.0).abs() < 1e-12);
+        assert!((comet_magnitude(11.0, 2.0, 1.0, 10.0) - 16.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn comet_search_finds_comets_in_the_field() {
+        let c = sample_comet();
+        let far = Conic {
+            node: c.node + 90.0,
+            ..c
+        };
+        let lines = [
+            comet_line(
+                "    CK26A020",
+                &c,
+                Some(20261116),
+                (11.0, 4.0),
+                "C/2026 A2 (Bok)",
+            ),
+            comet_line(
+                "    CK26A021",
+                &far,
+                Some(20261116),
+                (11.0, 4.0),
+                "C/2026 A9",
+            ),
+        ];
+        let text = format!("{}\n{}\n", lines[0], lines[1]);
+        let jd = 2_461_362.5;
+        let site = ephem::observatory("F51").unwrap();
+        let t = ephem::tt_from_utc(jd);
+        let epoch = parse_comet(lines[0].as_bytes()).unwrap().epoch.unwrap();
+        let state = orbit::integrate(c.state(epoch), epoch, t).unwrap();
+        let obs = ephem::observer(Some(&site), jd);
+        let truth = astrometric(&state, t, obs);
+        let (ra, dec) = ephem::ra_dec(truth.topocentric);
+        let query = FieldQuery {
+            ra,
+            dec: dec + 0.05,
+            radius: 0.1,
+            jd,
+            observatory: Some("F51".into()),
+        };
+        assert_eq!(comet_count(text.as_bytes()), 2);
+        assert_eq!(comet_count(&b"<html>Not found</html>\n"[..]), 0);
+        let found = comet_search(text.as_bytes(), &query).unwrap();
+        assert_eq!(found.len(), 1);
+        let k = &found[0];
+        assert_eq!(
+            (k.label(), k.name.as_str(), k.class.as_str()),
+            ("C/2026 A2", "Bok", "Comet")
+        );
+        assert!((k.ra - ra).abs() < 1e-9 && (k.dec - dec).abs() < 1e-9);
+        // Motion agrees with the positions an hour later, seen from the
+        // geocentre: from F51 the diurnal parallax (≈ 5″ at Δ = 1.6 au)
+        // turns 15° in an hour, which bends the path by ≈ 0.15″ there, more
+        // than the linear model's other errors.
+        let hour_later = |observatory: Option<&ephem::Observatory>| {
+            let t1 = ephem::tt_from_utc(jd + 1.0 / 24.0);
+            let state = orbit::integrate(c.state(epoch), epoch, t1).unwrap();
+            let seen = astrometric(&state, t1, ephem::observer(observatory, jd + 1.0 / 24.0));
+            ephem::ra_dec(seen.topocentric)
+        };
+        let geo = comet_search(
+            text.as_bytes(),
+            &FieldQuery {
+                observatory: None,
+                radius: 1.0,
+                ..query.clone()
+            },
+        )
+        .unwrap();
+        let (ra2, dec2) = geo[0].position_at(jd, jd + 1.0 / 24.0);
+        let (ra_true, dec_true) = hour_later(None);
+        let cos_dec = dec.to_radians().cos();
+        assert!(
+            (ra2 - ra_true).abs() * cos_dec * 3600.0 < 0.05
+                && (dec2 - dec_true).abs() * 3600.0 < 0.05,
+            "{} {}",
+            (ra2 - ra_true) * cos_dec * 3600.0,
+            (dec2 - dec_true) * 3600.0
+        );
+        let (ra2, dec2) = k.position_at(jd, jd + 1.0 / 24.0);
+        let (ra_true, dec_true) = hour_later(Some(&site));
+        let off = ((ra2 - ra_true) * cos_dec).hypot(dec2 - dec_true) * 3600.0;
+        assert!(off < 0.3, "{off}");
+        // The total magnitude follows the law from r and Δ.
+        let expected = comet_magnitude(11.0, 4.0, ephem::norm(truth.heliocentric), truth.distance);
+        assert!((k.magnitude.unwrap() - expected).abs() < 1e-9);
+
+        // Unperturbed lines (no epoch) move on the two-body conic.
+        let two_body = comet_line("    CK26A020", &c, None, (11.0, 4.0), "C/2026 A2 (Bok)");
+        let truth = astrometric(&State::two_body(c.state(t), t), t, obs);
+        let (ra, dec) = ephem::ra_dec(truth.topocentric);
+        let found = comet_search(
+            two_body.as_bytes(),
+            &FieldQuery {
+                ra,
+                dec,
+                ..query.clone()
+            },
+        )
+        .unwrap();
+        assert_eq!(found.len(), 1);
+        assert!((found[0].ra - ra).abs() < 1e-9 && (found[0].dec - dec).abs() < 1e-9);
+        assert!(
+            comet_search(
+                text.as_bytes(),
+                &FieldQuery {
+                    observatory: Some("ZZZ".into()),
+                    ..query
+                }
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn comet_places_match_jpl() {
+        // MPC one-line elements of 2026 Nov 16 for a near-parabolic and a
+        // hyperbolic comet (neither active enough for non-gravitational
+        // terms), against JPL Horizons' geocentric astrometric RA/Dec at
+        // 0h UT 263 days before the epoch, 4 days after and 60 days after
+        // (Horizons API, 2026-11-17, its own orbit solutions). The MPC and
+        // JPL orbits differ slightly; we agree within 0.8″.
+        let text = "    CK26A020  2026 12 22.3548  1.937770  0.997665  155.9390  206.5873   82.3062  20261116  11.0  4.0  C/2026 A2 (Bok)                                          MPC xxxxx
+    CK26A030  2027 09 30.3066  4.806210  1.002742  239.0456  307.0053  157.4343  20261116  12.1  4.0  C/2026 A3 (PANSTARRS)                                    MPC xxxxx
+";
+        let jpl = [
+            ("C/2026 A2", 2_461_100.5, 264.252713783, 43.638634937),
+            ("C/2026 A2", 2_461_360.5, 314.897763109, 44.244378998),
+            ("C/2026 A2", 2_461_420.5, 353.599336485, 8.808268136),
+            ("C/2026 A3", 2_461_100.5, 127.002129727, 20.308611926),
+            ("C/2026 A3", 2_461_360.5, 118.271498242, 12.377216572),
+            ("C/2026 A3", 2_461_420.5, 99.251251248, 11.011699692),
+        ];
+        for (label, jd, ra, dec) in jpl {
+            let found = comet_search(
+                text.as_bytes(),
+                &FieldQuery {
+                    ra,
+                    dec,
+                    radius: 0.1,
+                    jd,
+                    observatory: None,
+                },
+            )
+            .unwrap();
+            let o = found.iter().find(|o| o.label() == label).unwrap();
+            let off = ((o.ra - ra) * dec.to_radians().cos()).hypot(o.dec - dec) * 3600.0;
+            assert!(off < 1.5, "{label} at {jd}: {off:.2}″");
+        }
+    }
+
+    /// Reads a real `CometEls.txt` (not in git) and checks that every line
+    /// parses: `OPENCERES_COMETELS=data/CometEls.txt cargo test -p
+    /// openceres-core -- --ignored real_cometels`
+    #[test]
+    #[ignore]
+    fn real_cometels_parses() {
+        let path = std::env::var("OPENCERES_COMETELS").unwrap();
+        let text = std::fs::read_to_string(path).unwrap();
+        let mut n = 0;
+        for line in text.lines() {
+            let c = parse_comet(line.as_bytes()).unwrap_or_else(|| panic!("{line}"));
+            assert!(c.name.len() > 1, "{line}");
+            let (p, _) = c.orbit.state(c.epoch.unwrap_or(c.orbit.perihelion_time));
+            assert!(p.iter().all(|x| x.is_finite()), "{line}");
+            n += 1;
+        }
+        println!("{n} comets");
+        assert!(n > 500);
+        // Geocentric astrometric places for comparison with JPL Horizons.
+        for jd in [2_461_100.5, 2_461_360.5, 2_461_420.5] {
+            let all = comet_search(
+                text.as_bytes(),
+                &FieldQuery {
+                    ra: 0.0,
+                    dec: 0.0,
+                    radius: 180.0,
+                    jd,
+                    observatory: None,
+                },
+            )
+            .unwrap();
+            for o in all.iter().filter(|o| {
+                [
+                    "4P",
+                    "12P",
+                    "29P",
+                    "C/2025 R2",
+                    "C/2026 A2",
+                    "C/2026 A3",
+                    "C/2026 B2",
+                ]
+                .contains(&o.label())
+            }) {
+                println!(
+                    "JD {jd} {:10} {:.6} {:+.6} {:?}",
+                    o.label(),
+                    o.ra,
+                    o.dec,
+                    o.magnitude.map(|m| (m * 100.0).round() / 100.0)
+                );
+            }
+        }
     }
 }

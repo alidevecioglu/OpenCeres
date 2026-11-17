@@ -16,8 +16,10 @@ pub enum Icon {
     Next,
     Play,
     Pause,
-    Minus,
-    Plus,
+    /// A tortoise: blink slower.
+    Slower,
+    /// A hare: blink faster.
+    Faster,
     Stars,
     Invert,
     Align,
@@ -36,6 +38,20 @@ pub enum Icon {
     Keyboard,
     Info,
     Search,
+    /// A page with lines of text: the MPC report.
+    Report,
+    /// A folder: open an image set.
+    Open,
+    /// Three dots: a menu of further actions.
+    More,
+    /// A ring with a plus: mark a moving object.
+    Mark,
+    /// A pencil: edit.
+    Edit,
+    /// A bin: delete.
+    Trash,
+    /// A triangle with `!`: something to check.
+    Warning,
 }
 
 pub fn paint(painter: &egui::Painter, rect: Rect, icon: Icon, color: Color32) {
@@ -67,11 +83,37 @@ pub fn paint(painter: &egui::Painter, rect: Rect, icon: Icon, color: Color32) {
                 painter.rect_filled(bar, 1.0 * s, color);
             }
         }
-        Icon::Minus | Icon::Plus => {
-            painter.hline((c.x - 4.5 * s)..=(c.x + 4.5 * s), c.y, stroke);
-            if icon == Icon::Plus {
-                painter.vline(c.x, (c.y - 4.5 * s)..=(c.y + 4.5 * s), stroke);
+        Icon::Slower => {
+            // A tortoise walking right: domed shell, head, two legs.
+            let dome: Vec<Pos2> = (0..=16)
+                .map(|i| {
+                    let a = i as f32 / 16.0 * std::f32::consts::PI;
+                    at(-1.25 - 4.75 * a.cos(), 1.75 - 5.25 * a.sin())
+                })
+                .collect();
+            painter.add(Shape::convex_polygon(dome, color, Stroke::NONE));
+            painter.circle_filled(at(5.0, 0.0), 1.75 * s, color);
+            painter.line_segment([at(3.0, 1.0), at(4.25, 0.25)], stroke);
+            for x in [-4.25, 1.75] {
+                painter.line_segment([at(x, 1.5), at(x, 4.5)], stroke);
             }
+        }
+        Icon::Faster => {
+            // A hare leaping right: long body, head, swept-back ears.
+            let body: Vec<Pos2> = (0..24)
+                .map(|i| {
+                    let a = i as f32 / 24.0 * TAU;
+                    let (x, y) = (4.25 * a.cos(), 2.5 * a.sin());
+                    let (cos, sin) = ((-0.2f32).cos(), (-0.2f32).sin());
+                    at(-1.25 + x * cos - y * sin, 2.0 + x * sin + y * cos)
+                })
+                .collect();
+            painter.add(Shape::convex_polygon(body, color, Stroke::NONE));
+            painter.circle_filled(at(3.75, -1.5), 2.0 * s, color);
+            painter.line_segment([at(2.5, -3.0), at(-1.25, -5.75)], stroke);
+            painter.line_segment([at(3.5, -3.25), at(0.75, -6.75)], stroke);
+            painter.line_segment([at(-4.5, 3.5), at(-6.75, 5.0)], stroke);
+            painter.line_segment([at(1.5, 3.75), at(4.0, 5.25)], stroke);
         }
         Icon::Stars => {
             // A detection ring around a star, with reticle ticks.
@@ -215,6 +257,23 @@ pub fn paint(painter: &egui::Painter, rect: Rect, icon: Icon, color: Color32) {
             painter.circle_stroke(at(-1.25, -1.25), 4.25 * s, stroke);
             painter.line_segment([at(1.9, 1.9), at(5.5, 5.5)], stroke);
         }
+        Icon::Report => {
+            // A sheet with a folded corner and three lines of text.
+            painter.line(
+                vec![
+                    at(2.0, -6.25),
+                    at(-4.75, -6.25),
+                    at(-4.75, 6.25),
+                    at(4.75, 6.25),
+                    at(4.75, -3.5),
+                    at(2.0, -6.25),
+                ],
+                stroke,
+            );
+            for y in [-1.5, 1.0, 3.5] {
+                painter.line_segment([at(-2.5, y), at(2.5, y)], detail);
+            }
+        }
         Icon::History => {
             // A clock face.
             painter.circle_stroke(c, 6.25 * s, stroke);
@@ -239,6 +298,81 @@ pub fn paint(painter: &egui::Painter, rect: Rect, icon: Icon, color: Color32) {
                 ],
                 stroke,
             ));
+        }
+        Icon::Open => {
+            painter.line(
+                vec![
+                    at(-6.25, 5.0),
+                    at(-6.25, -4.5),
+                    at(-2.0, -4.5),
+                    at(-0.5, -2.75),
+                    at(5.25, -2.75),
+                    at(5.25, -0.5),
+                ],
+                stroke,
+            );
+            painter.line(
+                vec![
+                    at(-6.25, 5.0),
+                    at(-4.0, -0.5),
+                    at(6.75, -0.5),
+                    at(4.5, 5.0),
+                    at(-6.25, 5.0),
+                ],
+                stroke,
+            );
+        }
+        Icon::More => {
+            for dx in [-4.5, 0.0, 4.5] {
+                painter.circle_filled(at(dx, 0.0), 1.4 * s, color);
+            }
+        }
+        Icon::Mark => {
+            // A mark's ring, and a plus for a new one.
+            painter.circle_stroke(at(-1.5, 1.5), 4.5 * s, stroke);
+            painter.line_segment([at(4.25, -6.75), at(4.25, -1.75)], stroke);
+            painter.line_segment([at(1.75, -4.25), at(6.75, -4.25)], stroke);
+        }
+        Icon::Edit => {
+            painter.line(
+                vec![
+                    at(-5.5, 5.5),
+                    at(-5.0, 2.5),
+                    at(3.0, -5.5),
+                    at(5.5, -3.0),
+                    at(-2.5, 5.0),
+                    at(-5.5, 5.5),
+                ],
+                stroke,
+            );
+            painter.line_segment([at(1.0, -3.5), at(3.5, -1.0)], detail);
+        }
+        Icon::Trash => {
+            painter.hline((c.x - 6.0 * s)..=(c.x + 6.0 * s), c.y - 4.0 * s, stroke);
+            painter.line(
+                vec![at(-2.0, -4.0), at(-2.0, -6.0), at(2.0, -6.0), at(2.0, -4.0)],
+                detail,
+            );
+            painter.line(
+                vec![at(-4.5, -4.0), at(-3.75, 6.0), at(3.75, 6.0), at(4.5, -4.0)],
+                stroke,
+            );
+            for dx in [-1.25, 1.25] {
+                painter.vline(c.x + dx * s, (c.y - 1.5 * s)..=(c.y + 3.5 * s), detail);
+            }
+        }
+        Icon::Warning => {
+            painter.line(
+                vec![
+                    at(0.0, -6.0),
+                    at(6.75, 5.75),
+                    at(-6.75, 5.75),
+                    at(0.0, -6.0),
+                ],
+                stroke,
+            );
+            painter.vline(c.x, (c.y - 2.0 * s)..=(c.y + 1.75 * s), stroke);
+            painter.circle_filled(at(0.0, 3.75), 0.9 * s, color);
         }
         Icon::Check => {
             painter.line(
@@ -284,6 +418,33 @@ pub fn button(ui: &mut egui::Ui, icon: Icon, selected: bool, enabled: bool) -> R
     } else {
         response
     }
+}
+
+/// A frameless toolbar button with an icon and a short label.
+pub fn text_button(ui: &mut egui::Ui, icon: Icon, text: &str, selected: bool) -> Response {
+    let p = palette(ui);
+    let color = if selected { p.accent } else { p.icon };
+    let galley = ui.painter().layout_no_wrap(
+        text.to_owned(),
+        egui::FontId::proportional(13.0),
+        if selected { p.accent } else { p.text },
+    );
+    let size = vec2(theme::TOOL + galley.size().x + 8.0, theme::TOOL);
+    let (rect, response) = ui.allocate_exact_size(size, Sense::click());
+    if ui.is_rect_visible(rect) {
+        let painter = ui.painter();
+        let radius = f32::from(theme::RADIUS);
+        if selected {
+            painter.rect_filled(rect, radius, p.accent_weak);
+        } else if response.hovered() || response.has_focus() {
+            painter.rect_filled(rect, radius, p.hover);
+        }
+        let square = Rect::from_min_size(rect.min, vec2(theme::TOOL, theme::TOOL));
+        paint(painter, square, icon, color);
+        let at = egui::pos2(square.max.x - 2.0, rect.center().y - galley.size().y / 2.0);
+        painter.galley(at, galley, p.text);
+    }
+    response.on_hover_cursor(CursorIcon::PointingHand)
 }
 
 /// A smaller frameless icon button (dismiss buttons in banners and windows).

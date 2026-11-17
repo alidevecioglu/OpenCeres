@@ -1,0 +1,65 @@
+# OpenCeres: English, the reference language.
+#
+# Every other language translates the keys of this file. One line per text:
+#
+#   key = text
+#
+# Lines starting with # are comments. {name} is filled in by the app; keep
+# it exactly as it is. \n starts a new line. See TRANSLATING.md.
+
+# Settings → General
+setting.language = Language
+setting.language.description = The language of OpenCeres's windows.
+setting.welcome = Welcome window
+setting.welcome.description = The short tour shown the first time OpenCeres starts.
+settings.show_welcome = Show welcome again
+settings.help_translate = Help translate OpenCeres
+
+# Language list
+language.complete = {percent} % translated
+
+# First-run window
+onboarding.title = Welcome to OpenCeres
+onboarding.subtitle = Five quick choices, then you are ready to search.
+onboarding.step = Step {n} of {total}
+onboarding.skip = Skip
+onboarding.back = Back
+onboarding.next = Next
+onboarding.later = Later
+onboarding.finish = Start searching
+
+onboarding.language.title = Language
+onboarding.language.body = Choose the language for OpenCeres. Translations are made by volunteers, and yours can be next.
+
+onboarding.appearance.title = Appearance
+onboarding.appearance.body = Light or dark windows. System follows your computer's setting. Images are always shown on a dark background.
+onboarding.appearance.system = System
+onboarding.appearance.light = Light
+onboarding.appearance.dark = Dark
+
+onboarding.team.title = Your team
+onboarding.team.body = These go into the header of every MPC report. All of them are optional: fill them in now, or later in Settings → Observer & report.
+onboarding.team.code = Observatory code
+onboarding.team.code_hint = The telescope's MPC code. Empty: taken from the images.
+onboarding.team.observers = Observers
+onboarding.team.observers_hint = Initials and surname, separated by commas.
+onboarding.team.prefix = Designation prefix
+onboarding.team.prefix_hint = New objects get this and a number. One per team.
+onboarding.team.measured_by = Measured by
+onboarding.team.measured_by_hint = Filled in for new searches; each search can change it.
+
+onboarding.known.title = Known objects
+onboarding.known.body = OpenCeres marks the asteroids and comets that are already known, so you can tell them apart from new ones.
+onboarding.known.download = Download now
+onboarding.known.download_hint = The Minor Planet Center's MPCORB catalogue with comet orbits, about 94 MB. Works offline afterwards.
+onboarding.known.later_hint = Choose Later to look known objects up online (IMCCE's SkyBoT service) meanwhile. Settings → Known objects downloads it at any time.
+onboarding.known.present = The MPCORB catalogue is already on this computer.
+onboarding.known.use = Use it, also offline
+onboarding.known.downloading = Downloading. You can go on; the download continues in the background.
+onboarding.known.downloaded = Downloaded. Known objects are now found on this computer, also offline.
+
+onboarding.tips.title = Three tips
+onboarding.tips.blink = Press {key} to blink the frames. Stars stand still; what moves jumps.
+onboarding.tips.mark = Click what moves on each frame, one frame after the other.
+onboarding.tips.report = Then choose “{button}” and paste the report into your campaign's report box.
+onboarding.tips.shortcuts = Press {key} at any time to see all keyboard shortcuts.

@@ -52,7 +52,12 @@ pub fn calendar_to_jd(date: CalendarDate) -> f64 {
 
 /// Parses a FITS `DATE-OBS` value such as `2026-10-29T12:17:46.5` (or a plain date) to JD.
 pub fn parse_iso(value: &str) -> Option<f64> {
-    let (date, time) = value.split_once('T').unwrap_or((value, "00:00:00"));
+    let value = value.trim();
+    // Some headers (Pan-STARRS's SHMD* times) put a space where ISO 8601 has `T`.
+    let (date, time) = value
+        .split_once('T')
+        .or_else(|| value.split_once(' '))
+        .unwrap_or((value, "00:00:00"));
     let mut d = date.split('-');
     let year: i32 = d.next()?.parse().ok()?;
     let month: u32 = d.next()?.parse().ok()?;
@@ -88,10 +93,25 @@ pub fn start_jd(header: &crate::fits::Header) -> Option<f64> {
 
 /// Julian date (UTC) of the middle of the exposure, which is what MPC
 /// reports need: [`start_jd`] plus half of `EXPTIME`.
+///
+/// Pan-STARRS frames also give the UTC times the exposure opened and closed
+/// at the middle of the focal plane (`SHMDOUTC`, `SHMDCUTC`): its shutter
+/// is two sliding blades, and the header says 0.5 s was added to the blade
+/// times for the focal plane's centre (`SHMDOOFF`, `SHMDCOFF`), so the
+/// exposure's middle there is 0.5 s after `DATE-OBS` + `EXPTIME`/2. When
+/// both are present and agree with `DATE-OBS` to within 2 s, their midpoint
+/// is used.
 pub fn mid_exposure_jd(header: &crate::fits::Header) -> Option<f64> {
     let start = start_jd(header)?;
     let exposure = header.float("EXPTIME").unwrap_or(0.0);
-    Some(start + exposure / 2.0 / 86_400.0)
+    let simple = start + exposure / 2.0 / 86_400.0;
+    let shutter = header
+        .text("SHMDOUTC")
+        .and_then(parse_iso)
+        .zip(header.text("SHMDCUTC").and_then(parse_iso))
+        .map(|(open, close)| (open + close) / 2.0)
+        .filter(|mid| (mid - simple).abs() * 86_400.0 <= 2.0);
+    Some(shutter.unwrap_or(simple))
 }
 
 #[cfg(test)]
@@ -175,5 +195,46 @@ mod tests {
         let bytes = crate::fits::tests::make_fits(1, 1, &["MJD-OBS =     61317.5"], &[0.0]);
         let header = crate::fits::parse(&bytes).unwrap().header;
         assert_eq!(start_jd(&header), Some(61317.5 + MJD_OFFSET));
+    }
+
+    /// Pan-STARRS: the mid-focal-plane open/close times, 0.5 s after
+    /// DATE-OBS (values from an IASC frame's header).
+    #[test]
+    fn pan_starrs_shutter_times_refine_the_middle() {
+        let bytes = crate::fits::tests::make_fits(
+            1,
+            1,
+            &[
+                "DATE-OBS= '2026-10-04T10:15:39.832315'",
+                "EXPTIME =                  45.",
+                "SHMDOUTC= '2026-10-04T10:15:40.332321'",
+                "SHMDCUTC= '2026-10-04 10:16:25.332318'",
+            ],
+            &[0.0],
+        );
+        let header = crate::fits::parse(&bytes).unwrap().header;
+        let mid = mid_exposure_jd(&header).unwrap();
+        let expected = parse_iso("2026-10-04T10:16:02.83232").unwrap();
+        assert!(
+            (mid - expected).abs() * 86_400.0 < 1e-3,
+            "{}",
+            (mid - expected) * 86_400.0
+        );
+        // Times that disagree with DATE-OBS are ignored.
+        let bytes = crate::fits::tests::make_fits(
+            1,
+            1,
+            &[
+                "DATE-OBS= '2026-10-04T10:15:39.832315'",
+                "EXPTIME =                  45.",
+                "SHMDOUTC= '2026-10-04T11:15:40.332321'",
+                "SHMDCUTC= '2026-10-04 11:16:25.332318'",
+            ],
+            &[0.0],
+        );
+        let header = crate::fits::parse(&bytes).unwrap().header;
+        let mid = mid_exposure_jd(&header).unwrap();
+        let expected = parse_iso("2026-10-04T10:16:02.332315").unwrap();
+        assert!((mid - expected).abs() * 86_400.0 < 1e-3);
     }
 }

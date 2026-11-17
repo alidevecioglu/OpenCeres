@@ -1,6 +1,6 @@
-//! The search history in the window: the "Your search" section of the side
-//! panel, saving as the student works, and the History window (search,
-//! filters, status updates, export and import). Storage is in
+//! The search history: saving as the user works (the side panel's footer
+//! shows that it did), and the History window (search, filters, status,
+//! designation and notes, export and import). Storage is in
 //! [`crate::history`].
 
 use eframe::egui::{
@@ -50,7 +50,10 @@ enum Action {
 
 impl App {
     pub(super) fn modal_open(&self) -> bool {
-        self.settings_open || self.searches.window_open || self.team.window_open
+        self.settings_open
+            || self.searches.window_open
+            || self.team.window_open
+            || self.onboarding.is_open()
     }
 
     pub(super) fn toggle_history(&mut self) {
@@ -165,7 +168,7 @@ impl App {
     }
 
     /// Forgets the open set's earlier search and starts a new one.
-    fn start_new_search(&mut self) {
+    pub(super) fn start_new_search(&mut self) {
         let h = &mut self.searches;
         let Some(old) = &h.record else { return };
         let mut r = Record::new(&old.set, &h.config.name, self.grid_size);
@@ -241,85 +244,6 @@ impl App {
                 Some(x) => x.clone_from(r),
                 None => list.insert(0, r.clone()),
             }
-        }
-    }
-
-    /// "Your search" in the side panel: who searched, how it went, notes.
-    pub(super) fn search_section(&mut self, ui: &mut egui::Ui) {
-        let p = palette(ui);
-        let h = &mut self.searches;
-        let Some(r) = &mut h.record else { return };
-        ui.horizontal(|ui| {
-            ui.label(
-                RichText::new("Your search")
-                    .family(theme::semibold())
-                    .color(p.text),
-            );
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                if let Some(e) = &h.error {
-                    ui.label(RichText::new("Not saved").small().color(p.danger))
-                        .on_hover_text(e);
-                } else if h.saved.is_some() {
-                    ui.label(RichText::new("Saved").small().color(p.muted))
-                        .on_hover_text("Saved in the history as you work (H to see it)");
-                }
-            });
-        });
-        let w = ui.available_width();
-        let name = ui
-            .add(
-                TextEdit::singleline(&mut r.searched_by)
-                    .hint_text("Your name")
-                    .desired_width(w),
-            )
-            .on_hover_text("Searched by. Also filled in for your next searches.");
-        if name.changed() {
-            h.config.name = r.searched_by.trim().to_owned();
-            if self.capture.is_none() {
-                h.config.save();
-            }
-        }
-        status_combo(ui, Id::new("search_status"), &mut r.status, w);
-        if r.status.has_designation() {
-            ui.add(
-                TextEdit::singleline(&mut r.designation)
-                    .hint_text("Designation, e.g. 2026 UX12")
-                    .desired_width(w),
-            );
-        }
-        ui.add(
-            TextEdit::multiline(&mut r.notes)
-                .hint_text("Notes")
-                .desired_rows(2)
-                .desired_width(w),
-        );
-        let mut fresh = false;
-        if let Some(t) = h.resumed {
-            ui.horizontal_wrapped(|ui| {
-                ui.spacing_mut().item_spacing.x = S1;
-                ui.label(
-                    RichText::new(format!("Continued from {} ·", day(t)))
-                        .small()
-                        .color(p.muted),
-                );
-                fresh = ui
-                    .link(RichText::new("Start new").small().color(p.accent))
-                    .on_hover_text("Keep the earlier search in the history and start again")
-                    .clicked();
-            });
-        }
-        if !h.others.is_empty() {
-            ui.add(
-                Label::new(
-                    RichText::new(format!("Also searched by {}", h.others.join(", ")))
-                        .small()
-                        .color(p.muted),
-                )
-                .wrap(),
-            );
-        }
-        if fresh {
-            self.start_new_search();
         }
     }
 

@@ -16,7 +16,7 @@ use eframe::egui::{
     TextEdit, vec2,
 };
 
-use super::{App, hline, muted_wrapped, section_heading};
+use super::{App, hline, muted_wrapped};
 use crate::format;
 use crate::history::Record;
 use crate::icons::{self, Icon};
@@ -306,7 +306,7 @@ impl App {
     }
 
     /// Everyone's reports of the matched set.
-    fn team_fetch_findings(&mut self) {
+    pub(super) fn team_fetch_findings(&mut self) {
         let t = &mut self.team;
         let Some(m) = &t.matched else { return };
         if !t.ready() || t.fetching {
@@ -650,94 +650,116 @@ impl App {
     // ------------------------------------------------------------------
     // Side panel
 
-    /// Whether the panel has a "Team review" section for the open set.
+    /// Whether the panel has a Team row for the open set.
     pub(super) fn team_has_section(&self) -> bool {
         let t = &self.team;
         self.set.is_some() && (t.matched.is_some() || t.looking_up || t.lookup_error.is_some())
     }
 
-    /// The campaign badge, "Submit review" and what came of it.
+    /// One row, the campaign badge and "Submit to team", with details in
+    /// the tooltip; below it only what is happening or went wrong.
     pub(super) fn team_section(&mut self, ui: &mut egui::Ui) {
         let p = palette(ui);
-        section_heading(ui, "Team review", None);
         let t = &self.team;
         if t.looking_up {
             spinner_line(ui, "Asking the team server about this set…");
             return;
         }
         if t.expired && t.matched.is_none() {
-            self.signed_out_row(ui, "You were signed out. Sign in to check this set.");
+            self.signed_out_row(ui, "Signed out: sign in to check this set.");
             return;
         }
         if let Some(e) = &t.lookup_error {
-            small(ui, format!("Couldn't ask the team server: {e}"), p.danger);
-            if ui.small_button("Try again").clicked() {
+            let mut retry = false;
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = S1;
+                ui.add(
+                    Label::new(
+                        RichText::new("Team server unreachable ·")
+                            .small()
+                            .color(p.danger),
+                    )
+                    .truncate(),
+                )
+                .on_hover_text(e.as_str());
+                retry = ui
+                    .link(RichText::new("Try again").small().color(p.accent))
+                    .clicked();
+            });
+            if retry {
                 self.team_lookup();
             }
             return;
         }
         let Some(m) = &t.matched else { return };
-        Frame::new()
-            .fill(p.accent_weak)
-            .corner_radius(theme::RADIUS)
-            .inner_margin(Margin::symmetric(S2 as i8, S1 as i8 + 2))
-            .show(ui, |ui| {
-                ui.set_width(ui.available_width());
-                ui.spacing_mut().item_spacing.y = 2.0;
-                ui.add(
-                    Label::new(
-                        RichText::new(m.badge())
-                            .family(theme::semibold())
-                            .color(p.accent),
-                    )
-                    .wrap(),
-                );
-                let mut parts = Vec::new();
-                if !m.team.name.is_empty() {
-                    parts.push(m.team.name.clone());
-                }
-                if m.assigned {
-                    parts.push("assigned to you".into());
-                } else if m.role == "teacher" {
-                    parts.push("you teach this team".into());
-                }
-                if let Some(s) = &m.status {
-                    parts.push(capitalized(s));
-                }
-                if !parts.is_empty() {
-                    small(ui, parts.join(" · "), p.text);
-                }
-            });
+        let mut details = Vec::new();
+        if !m.team.name.is_empty() {
+            details.push(m.team.name.clone());
+        }
+        if m.assigned {
+            details.push("assigned to you".into());
+        } else if m.role == "teacher" {
+            details.push("you lead this team".into());
+        }
+        if let Some(s) = &m.status {
+            details.push(capitalized(s));
+        }
+        let findings = if t.hidden {
+            "The others' findings appear once you submit yours.".to_owned()
+        } else {
+            match t.shared.len() {
+                0 => "No one else has submitted this set yet.".to_owned(),
+                1 => "1 report from the team is shown under Imported reports.".to_owned(),
+                n => format!("{n} reports from the team are shown under Imported reports."),
+            }
+        };
+        let tip = format!("{}\n{}\n{findings}", m.badge(), details.join(" · "));
         if t.expired {
-            self.signed_out_row(ui, "You were signed out. Sign in to submit your review.");
+            self.signed_out_row(ui, "Signed out: sign in to submit.");
             return;
         }
-        // The server takes reviews from those assigned and from teachers.
+        // The server takes searches from those assigned and from the
+        // team's leads.
         let allowed = m.assigned || m.role == "teacher";
         let can_submit = allowed
             && self.searches.record.is_some()
             && self.marking.is_none()
             && !t.submitting
             && t.ready();
-        let w = ui.available_width();
-        let button = ui
-            .add_enabled(
-                can_submit,
-                primary(ui, "Submit review").min_size(vec2(w, theme::TOOL)),
-            )
-            .on_hover_text(
-                "Send your search, with the objects you marked, to the team. You can \
-                 submit again after changes.",
-            )
-            .on_disabled_hover_text(if !allowed {
-                "This set is assigned to someone else"
-            } else if self.marking.is_some() {
-                "Finish marking the object first"
-            } else {
-                "Your search could not be started for this set"
+        let badge = m.badge();
+        let mut submit = false;
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = S2;
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                submit = ui
+                    .add_enabled(can_submit, Button::new("Submit to team"))
+                    .on_hover_text(
+                        "Send your search, with the objects you marked, to the team. You \
+                         can submit again after changes.",
+                    )
+                    .on_disabled_hover_text(if !allowed {
+                        "This set is assigned to someone else"
+                    } else if self.marking.is_some() {
+                        "Finish marking the object first"
+                    } else {
+                        "Your search could not be started for this set"
+                    })
+                    .clicked();
+                ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                    ui.add(
+                        Label::new(
+                            RichText::new(badge)
+                                .family(theme::semibold())
+                                .color(p.accent),
+                        )
+                        .truncate(),
+                    )
+                    .on_hover_text(tip);
+                });
             });
-        let submit = button.clicked();
+        });
         let t = &self.team;
+        let mut refresh = false;
         if t.submitting {
             spinner_line(ui, "Submitting…");
         } else if let Some(e) = &t.submit_error {
@@ -745,32 +767,22 @@ impl App {
         } else if let Some(n) = &t.submit_note {
             small(ui, n.clone(), p.muted);
         }
-        let mut refresh = false;
         if t.fetching {
             spinner_line(ui, "Getting the team's findings…");
         } else if let Some(e) = &t.findings_error {
-            small(
-                ui,
-                format!("Couldn't get the team's findings: {e}"),
-                p.danger,
-            );
-            refresh = ui.small_button("Try again").clicked();
-        } else {
-            let text = if t.hidden {
-                "The others' findings appear once you submit yours.".to_owned()
-            } else {
-                match t.shared.len() {
-                    0 => "No one else has submitted this set yet.".to_owned(),
-                    1 => "1 report from the team is shown below.".to_owned(),
-                    n => format!("{n} reports from the team are shown below."),
-                }
-            };
-            ui.horizontal_wrapped(|ui| {
+            ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = S1;
-                ui.label(RichText::new(text).small().color(p.muted));
+                ui.add(
+                    Label::new(
+                        RichText::new("Couldn't get the team's findings ·")
+                            .small()
+                            .color(p.danger),
+                    )
+                    .truncate(),
+                )
+                .on_hover_text(e.as_str());
                 refresh = ui
-                    .link(RichText::new("Refresh").small().color(p.accent))
-                    .on_hover_text("Ask the server for new findings")
+                    .link(RichText::new("Try again").small().color(p.accent))
                     .clicked();
             });
         }
@@ -805,7 +817,7 @@ impl App {
         let text = self.team.submit_error.as_deref().unwrap_or(fallback);
         small(ui, text.to_owned(), p.danger);
         if ui
-            .add(primary(ui, "Sign in…"))
+            .button("Sign in…")
             .on_hover_text("Settings → Team")
             .clicked()
         {

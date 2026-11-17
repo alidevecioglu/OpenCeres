@@ -2,14 +2,16 @@
 //! window), an optional report side panel and a slim status bar.
 
 pub(crate) mod history_ui;
+pub(crate) mod mpc_ui;
 mod objects_ui;
 mod offers_ui;
+pub(crate) mod onboarding_ui;
 pub(crate) mod settings_ui;
 pub(crate) mod team_ui;
 
 use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, TryRecvError};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use eframe::egui::{
     self, Align, Align2, Button, Color32, CursorIcon, Event, FontId, Frame, Id, Key, Label, Layout,
@@ -24,9 +26,12 @@ use crate::history::{self, Record, Tagged, box_label, report_line};
 use crate::icons::{self, Icon};
 use crate::known::{self, Catalogue, Download, Fetched, Freshness, Lookup, LookupError};
 use crate::load::{self, Frame as ImageFrame, ImageSet};
-use crate::prefs::{GRID_SIZES, KnownSource, Prefs, SPEEDS, ThemeChoice};
+use crate::menubar::{self, Cmd};
+use crate::prefs::{GRID_SIZES, KnownSource, Prefs, ThemeChoice};
 use crate::settings::Category;
+use crate::speed;
 use crate::theme::{self, S1, S2, S3, S4, S5, palette};
+use crate::titlebar;
 use crate::update;
 use offers_ui::Offer;
 use openceres_core::align::Affine;
@@ -60,7 +65,12 @@ struct Loading {
 
 /// Known objects for the open set: being looked up, found, or why not.
 enum KnownState {
-    Pending(Receiver<Result<Lookup, LookupError>>),
+    Pending {
+        rx: Receiver<Result<Lookup, LookupError>>,
+        started: Instant,
+        /// The source asked (Automatic already resolved).
+        source: KnownSource,
+    },
     Done(KnownField),
     /// The offline source is chosen but the catalogue is not downloaded.
     NoCatalogue,
@@ -168,6 +178,8 @@ pub struct App {
     next_switch: f64,
     // Session state, started from the defaults in `prefs`.
     blink_seconds: f32,
+    /// The toolbar's blink speed popover is open.
+    speed_open: bool,
     show_stars: bool,
     invert: bool,
     /// Frames drawn aligned on their stars (session toggle, A).
@@ -189,6 +201,9 @@ pub struct App {
     objects: Vec<Tagged>,
     /// The object being marked (index into `objects`).
     marking: Option<usize>,
+    /// Frames already visited (marked or skipped) since marking started,
+    /// so the next frame to mark comes round in order without repeats.
+    mark_visited: Vec<bool>,
     /// While editing a finished object: how it was before.
     editing: Option<Tagged>,
     /// How the last mark was placed.
@@ -196,6 +211,12 @@ pub struct App {
     report_note: Option<String>,
     report_error: Option<String>,
     export: Option<objects_ui::Export>,
+    /// The MPC report: Gaia stars, measurements, the review window.
+    mpc: mpc_ui::Mpc,
+    /// The team's observer details for report headers.
+    report_config: crate::report::Config,
+    /// VizieR mirror tests from Settings.
+    mirror_tests: mpc_ui::MirrorTests,
     /// Other students' reports of the open set, shown over the images.
     reviews: Vec<objects_ui::Review>,
     review_note: Option<String>,
@@ -204,6 +225,8 @@ pub struct App {
     known: Option<KnownState>,
     /// Known object the view was last centred on (index into the list).
     known_focus: Option<usize>,
+    /// The panel's Known objects section is open (it starts as one line).
+    known_expanded: bool,
     download: Option<Download>,
     download_error: Option<String>,
     /// e.g. "Already up to date", after a download that fetched nothing.
@@ -212,8 +235,6 @@ pub struct App {
     mpcorb_check: Option<(Receiver<Result<Freshness, String>>, bool)>,
     /// Result of the last check asked for in Settings.
     mpcorb_fresh: Option<Result<Freshness, String>>,
-    /// The background check found a newer catalogue (hint in the panel).
-    mpcorb_newer: bool,
     mpcorb_auto_done: bool,
     /// What the startup checks found and the user was asked about.
     offers: offers_ui::Offers,
@@ -235,6 +256,8 @@ pub struct App {
     /// "Reset all" was clicked once and waits for confirmation.
     confirm_reset: bool,
     help_open: bool,
+    /// The welcome window (see [`onboarding_ui`]).
+    onboarding: onboarding_ui::Onboarding,
     capture: Option<Capture>,
 }
 
@@ -250,12 +273,18 @@ fn shortcuts() -> Vec<(Vec<String>, &'static str)> {
         (keys(&["Space"]), "Play / pause blinking"),
         (keys(&["←", "→"]), "Previous / next frame"),
         (keys(&["1", "–", "4"]), "Show one frame"),
-        (keys(&[",", "."]), "Blink slower / faster (or [ ])"),
+        (
+            keys(&[",", "."]),
+            "Blink slower / faster (or [ ]); Shift for bigger steps",
+        ),
         (keys(&["+", "−", "0"]), "Zoom in / out, fit"),
         (keys(&["S"]), "Detected stars"),
         (keys(&["I"]), "Invert"),
         (keys(&["A"]), "Align frames on the stars"),
-        (keys(&["G"]), "Report grid (click a box to mark it)"),
+        (
+            keys(&["G"]),
+            "Report grid, when Box report is on in Features",
+        ),
         (keys(&["M"]), "Mark a moving object on each frame"),
         (keys(&["Enter"]), "While marking: use the predicted spot"),
         (keys(&["K"]), "Known objects in the field"),
@@ -274,6 +303,7 @@ impl App {
         capture: Option<Capture>,
     ) -> App {
         theme::install(&cc.egui_ctx);
+        menubar::install(&cc.egui_ctx);
         // Captures start from the defaults so they look the same everywhere.
         let mut prefs = if capture.is_some() {
             Prefs::default()
@@ -287,12 +317,14 @@ impl App {
                 None => {}
             }
             prefs.panel_open |= c.state.panel;
+            prefs.panel_shown = true;
+            prefs.box_report |= c.state.box_report;
             // Captures turn these on themselves, and must not depend on SkyBoT.
             prefs.show_grid = false;
             prefs.show_known = false;
         } else {
             // The report and the known-object list live in the side panel.
-            prefs.panel_open |= prefs.show_grid || prefs.show_known;
+            prefs.panel_open |= (prefs.box_report && prefs.show_grid) || prefs.show_known;
         }
         let searches = Searches {
             config: history::Config::load(),
@@ -300,6 +332,8 @@ impl App {
             ..Searches::default()
         };
         let team = team_ui::Team::new(&cc.egui_ctx, capture.is_none());
+        crate::i18n::set_language(prefs.language);
+        let onboarding = onboarding_ui::Onboarding::start(&prefs, capture.as_ref());
         let mut app = App {
             prefs,
             saved: prefs,
@@ -310,10 +344,11 @@ impl App {
             playing: true,
             next_switch: 0.0,
             blink_seconds: prefs.blink_seconds,
+            speed_open: false,
             show_stars: prefs.show_stars,
             invert: prefs.invert,
             align_on: prefs.align,
-            grid_on: prefs.show_grid,
+            grid_on: prefs.box_report && prefs.show_grid,
             grid_size: prefs.grid_size,
             marks: Vec::new(),
             object_boxes: Vec::new(),
@@ -322,22 +357,30 @@ impl App {
             grid_change: None,
             objects: Vec::new(),
             marking: None,
+            mark_visited: Vec::new(),
             editing: None,
             snap: None,
             report_note: None,
             report_error: None,
             export: None,
+            mpc: mpc_ui::Mpc::default(),
+            report_config: if capture.is_some() {
+                crate::report::Config::default()
+            } else {
+                crate::report::Config::load()
+            },
+            mirror_tests: mpc_ui::MirrorTests::default(),
             reviews: Vec::new(),
             review_note: None,
             known_on: prefs.show_known,
             known: None,
             known_focus: None,
+            known_expanded: false,
             download: None,
             download_error: None,
             download_note: None,
             mpcorb_check: None,
             mpcorb_fresh: None,
-            mpcorb_newer: false,
             mpcorb_auto_done: false,
             offers: offers_ui::Offers::default(),
             updates: Updates::default(),
@@ -353,6 +396,7 @@ impl App {
             settings_search: String::new(),
             confirm_reset: false,
             help_open: false,
+            onboarding,
             capture,
         };
         app.team_start();
@@ -483,6 +527,14 @@ impl App {
                 self.editing = None;
                 self.snap = None;
                 self.reviews.clear();
+                if let mpc_ui::GaiaState::Fetching(f) = &self.mpc.gaia {
+                    f.cancel();
+                }
+                let forced = self.mpc.forced;
+                self.mpc = mpc_ui::Mpc {
+                    forced,
+                    ..mpc_ui::Mpc::default()
+                };
                 self.report_note = None;
                 self.report_error = None;
                 self.review_note = None;
@@ -493,6 +545,12 @@ impl App {
                 self.next_switch = now + self.period();
                 self.view = View::default();
                 self.hover = None;
+                // The panel opens by itself for the first set ever loaded,
+                // so its report is found; after that it stays as left.
+                if !self.prefs.panel_shown {
+                    self.prefs.panel_open = true;
+                    self.prefs.panel_shown = true;
+                }
                 self.start_search();
                 self.team_set_opened();
             }
@@ -519,19 +577,20 @@ impl App {
         }
     }
 
-    /// `slower` > 0 moves to the next slower speed, < 0 to the next faster one.
-    fn change_speed(&mut self, slower: isize, now: f64) {
-        let at = SPEEDS
-            .iter()
-            .position(|&s| s >= self.blink_seconds)
-            .unwrap_or(SPEEDS.len() - 1);
-        let i = (at as isize + slower.signum()).clamp(0, SPEEDS.len() as isize - 1);
-        self.set_speed(SPEEDS[i as usize], now);
+    /// One fine step slower or faster, or with `coarse` to the next round value.
+    fn change_speed(&mut self, slower: bool, coarse: bool, now: f64) {
+        let step = if coarse { speed::jump } else { speed::step };
+        self.set_speed(step(self.blink_seconds, slower), now);
     }
 
+    /// Keeps the time already spent on the current frame, so changing the
+    /// speed (even continuously, while dragging) never restarts or skips
+    /// it: the frame ends `seconds` after it started, or now if that has
+    /// already passed.
     fn set_speed(&mut self, seconds: f32, now: f64) {
+        let started = self.next_switch - self.period();
         self.blink_seconds = seconds;
-        self.next_switch = now + self.period();
+        self.next_switch = (started + self.period()).max(now);
     }
 
     /// Turning the grid on is an explicit request to report, so it also
@@ -634,14 +693,19 @@ impl App {
             return;
         }
         let Some(set) = &self.set else { return };
+        let source = known::effective(self.prefs.known_source);
         self.known = Some(match known::field(&set.frames) {
-            Ok(field) => KnownState::Pending(known::start(ctx, self.prefs.known_source, field)),
+            Ok(field) => KnownState::Pending {
+                rx: known::start(ctx, source, field),
+                started: Instant::now(),
+                source,
+            },
             Err(e) => KnownState::Failed(e),
         });
     }
 
     fn poll_known(&mut self) {
-        let Some(KnownState::Pending(rx)) = &self.known else {
+        let Some(KnownState::Pending { rx, .. }) = &self.known else {
             return;
         };
         let result = match rx.try_recv() {
@@ -671,12 +735,11 @@ impl App {
         match result {
             Ok(fetched) => {
                 self.download_error = None;
-                self.mpcorb_newer = false;
                 self.mpcorb_fresh = None;
                 if let Fetched::AlreadyCurrent = fetched {
                     self.download_note =
                         Some("Already up to date — nothing was downloaded.".into());
-                } else if self.prefs.known_source == KnownSource::Mpcorb {
+                } else if known::effective(self.prefs.known_source) == KnownSource::Mpcorb {
                     self.known = None; // look up again with the new catalogue
                 }
             }
@@ -685,7 +748,7 @@ impl App {
     }
 
     /// Asks the MPC whether the catalogue is current (HEAD only). Silent
-    /// checks only set the panel hint; Settings shows the result.
+    /// checks only offer a download; Settings shows the result.
     fn start_mpcorb_check(&mut self, ctx: &egui::Context, manual: bool) {
         if self.mpcorb_check.is_none() {
             self.mpcorb_check = Some((known::start_check(ctx), manual));
@@ -706,15 +769,8 @@ impl App {
             Err(TryRecvError::Disconnected) => Err("The check stopped unexpectedly.".into()),
         };
         self.mpcorb_check = None;
-        match &result {
-            Ok(Freshness::Current(_)) => self.mpcorb_newer = false,
-            Ok(Freshness::Newer(_)) => {
-                self.mpcorb_newer = true;
-                if !manual && self.download.is_none() {
-                    self.offers.catalogue = Offer::Asking;
-                }
-            }
-            Err(_) => {}
+        if matches!(result, Ok(Freshness::Newer(_))) && !manual && self.download.is_none() {
+            self.offers.catalogue = Offer::Asking;
         }
         if manual {
             self.mpcorb_fresh = Some(result);
@@ -733,7 +789,9 @@ impl App {
             self.updates.auto_done = true;
             self.start_update_check(ctx, false);
         }
-        if !self.mpcorb_auto_done && self.prefs.known_source == KnownSource::Mpcorb {
+        if !self.mpcorb_auto_done
+            && known::effective(self.prefs.known_source) == KnownSource::Mpcorb
+        {
             self.mpcorb_auto_done = true;
             if known::catalogue_path().is_some_and(|path| path.is_file()) {
                 self.start_mpcorb_check(ctx, false);
@@ -865,8 +923,8 @@ impl App {
         if p.align != before.align {
             self.align_on = p.align;
         }
-        if p.show_grid != before.show_grid {
-            self.set_grid(p.show_grid);
+        if p.show_grid != before.show_grid || p.box_report != before.box_report {
+            self.set_grid(p.box_report && p.show_grid);
         }
         if p.show_known != before.show_known {
             self.set_known(p.show_known);
@@ -998,6 +1056,7 @@ impl App {
             match event {
                 Event::Key {
                     key,
+                    physical_key,
                     pressed: true,
                     modifiers,
                     ..
@@ -1032,6 +1091,18 @@ impl App {
                     if widget_focused {
                         continue;
                     }
+                    // Shift + , . [ ] by key position, since Shift changes
+                    // the character they type.
+                    let is = |k: Key| key == k || physical_key == Some(k);
+                    let coarse = modifiers.shift && !modifiers.alt;
+                    if coarse && (is(Key::Comma) || is(Key::OpenBracket)) {
+                        self.change_speed(true, true, now);
+                        continue;
+                    }
+                    if coarse && (is(Key::Period) || is(Key::CloseBracket)) {
+                        self.change_speed(false, true, now);
+                        continue;
+                    }
                     match key {
                         Key::Space => self.toggle_play(now),
                         Key::ArrowLeft => self.step(-1),
@@ -1048,12 +1119,12 @@ impl App {
                     "s" | "S" => self.show_stars = !self.show_stars,
                     "i" | "I" => self.invert = !self.invert,
                     "a" | "A" => self.align_on = !self.align_on,
-                    "g" | "G" => self.set_grid(!self.grid_on),
+                    "g" | "G" if self.prefs.box_report => self.set_grid(!self.grid_on),
                     "m" | "M" if self.set.is_some() => self.start_marking(),
                     "k" | "K" => self.set_known(!self.known_on),
                     "h" | "H" => self.toggle_history(),
-                    "," | "[" => self.change_speed(1, now),
-                    "." | "]" => self.change_speed(-1, now),
+                    "," | "[" => self.change_speed(true, false, now),
+                    "." | "]" => self.change_speed(false, false, now),
                     "o" | "O" => self.choose(ctx, frame),
                     "?" => self.help_open = !self.help_open,
                     "\\" => self.prefs.panel_open = !self.prefs.panel_open,
@@ -1110,7 +1181,9 @@ impl App {
         ctx.request_repaint();
         if self.loading.is_some()
             || self.export.is_some()
-            || matches!(self.known, Some(KnownState::Pending(_)))
+            || matches!(self.known, Some(KnownState::Pending { .. }))
+            || self.mpc.job.is_some()
+            || matches!(self.mpc.gaia, mpc_ui::GaiaState::Fetching(_))
         {
             return;
         }
@@ -1145,6 +1218,7 @@ impl App {
         if s.known {
             self.set_known(true);
         }
+        self.known_expanded |= s.known_open;
         self.show_stars |= s.stars;
         self.invert |= s.invert;
         self.align_on &= !s.no_align;
@@ -1160,6 +1234,20 @@ impl App {
         }
         if s.paused || s.frame.is_some() {
             self.playing = false;
+        }
+        if let Some(secs) = s.speed {
+            self.blink_seconds = speed::tidy(secs);
+        }
+        self.speed_open |= s.speed_popover;
+        if let Some(text) = s
+            .details
+            .as_deref()
+            .and_then(|p| std::fs::read_to_string(p).ok())
+        {
+            self.report_config = crate::report::Config::parse(&text);
+        }
+        if let (Some(name), Some(r)) = (&s.measured, self.searches.record.as_mut()) {
+            r.searched_by = name.clone();
         }
         if let Some(n) = s.frame.filter(|&n| n >= 1 && n <= self.frame_count()) {
             self.index = n - 1;
@@ -1204,6 +1292,8 @@ impl App {
         if s.expired {
             self.team_capture_expired();
         }
+        self.mpc.forced = s.mpc.as_deref().and_then(mpc_ui::Forced::parse);
+        self.mpc.review_open = s.review;
         if let Some(Ok(records)) = s.report.as_deref().map(read) {
             self.review_note = Some(self.show_reports(records));
         }
@@ -1258,19 +1348,20 @@ impl App {
                     .inner_margin(Margin::symmetric(S2 as i8, 0)),
             )
             .show(ui, |ui| {
+                // macOS: the toolbar is the title bar. Empty space drags the
+                // window (registered first, so the buttons keep their
+                // clicks), and the window buttons sit at the left.
+                titlebar::drag_area(ui, ui.max_rect(), ui.id().with("titlebar"));
+                let inset = titlebar::left_inset(ui);
                 ui.horizontal_centered(|ui| {
                     ui.spacing_mut().item_spacing.x = 2.0;
-                    let open = ui
-                        .add_enabled(self.loading.is_none(), Button::new("Open…"))
-                        .on_hover_text(format!("Open an image set ({})", command_key("O")));
+                    ui.add_space(if inset > 0.0 { inset + S1 } else { 0.0 });
+                    self.brand(ui);
+                    // Folders: File → Open Folder… or drop one on the window.
+                    let open = icons::button(ui, Icon::Open, false, self.loading.is_none())
+                        .on_hover_text(format!("Open an image set… ({})", command_key("O")));
                     if open.clicked() {
                         self.choose(ui.ctx(), frame);
-                    }
-                    let folder = ui
-                        .add_enabled(self.loading.is_none(), Button::new("Folder…"))
-                        .on_hover_text("Open a folder of FITS images");
-                    if folder.clicked() {
-                        self.choose_folder(ui.ctx(), frame);
                     }
                     ui.add_space(S3);
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -1310,7 +1401,7 @@ impl App {
                             ui.add_space(S1);
                             let pill = update_pill(ui, &m.badge()).on_hover_text(
                                 "This set is part of your team's campaign. Submit your \
-                                 review in the side panel.",
+                                 search to the team in the side panel.",
                             );
                             if pill.clicked() {
                                 self.prefs.panel_open = true;
@@ -1319,7 +1410,9 @@ impl App {
                         if self.set.is_some() {
                             ui.add_space(S4);
                             self.view_toggles(ui);
-                            ui.add_space(S4);
+                            ui.add_space(S3);
+                            self.mark_button(ui);
+                            ui.add_space(S3);
                             self.blink_controls(ui);
                         }
                         ui.add_space(S3);
@@ -1331,7 +1424,89 @@ impl App {
             });
     }
 
-    /// Set name, then its summary in muted text, cut with … when narrow.
+    /// The app's mark and name at the start of the toolbar; only the mark
+    /// when the window is narrow and the toolbar needs the room.
+    fn brand(&self, ui: &mut egui::Ui) {
+        let (mark, _) = ui.allocate_exact_size(vec2(18.0, 18.0), Sense::hover());
+        paint_logo(ui, mark);
+        if ui.max_rect().width() >= 1100.0 {
+            ui.add_space(S2);
+            let p = palette(ui);
+            ui.label(RichText::new("OpenCeres").strong().color(p.text));
+        }
+        ui.add_space(S3);
+    }
+
+    /// Runs the commands chosen in the macOS menu bar, the same way as the
+    /// matching key or toolbar button, and tells the menu which items are
+    /// available and ticked.
+    fn menu_commands(&mut self, ctx: &egui::Context, frame: &eframe::Frame, now: f64) {
+        for cmd in menubar::take() {
+            match cmd {
+                Cmd::Settings => {
+                    self.settings_open = !self.settings_open;
+                    self.searches.window_open = false;
+                    self.team.window_open = false;
+                    self.help_open = false;
+                }
+                Cmd::CheckUpdates => self.open_settings(Category::Updates),
+                Cmd::Open if self.loading.is_none() => self.choose(ctx, frame),
+                Cmd::OpenFolder if self.loading.is_none() => self.choose_folder(ctx, frame),
+                Cmd::Open | Cmd::OpenFolder => {}
+                Cmd::History => self.toggle_history(),
+                Cmd::Play => self.toggle_play(now),
+                Cmd::PrevFrame => self.step(-1),
+                Cmd::NextFrame => self.step(1),
+                Cmd::Slower => self.change_speed(true, false, now),
+                Cmd::Faster => self.change_speed(false, false, now),
+                Cmd::Stars => self.show_stars = !self.show_stars,
+                Cmd::Invert => self.invert = !self.invert,
+                Cmd::Align => self.align_on = !self.align_on,
+                Cmd::Grid if self.prefs.box_report => self.set_grid(!self.grid_on),
+                Cmd::Grid => {}
+                Cmd::Known => self.set_known(!self.known_on),
+                Cmd::Mark if self.set.is_some() => self.start_marking(),
+                Cmd::Mark => {}
+                Cmd::ExportJson if self.can_export() => self.export_json(ctx, frame, false),
+                Cmd::ImportJson if self.set.is_some() => self.import_report(frame),
+                Cmd::ReviewReport if self.set.is_some() => self.mpc.review_open = true,
+                Cmd::ExportJson | Cmd::ImportJson | Cmd::ReviewReport => {}
+                Cmd::ZoomIn => self.zoom_by(1.25, None),
+                Cmd::ZoomOut => self.zoom_by(0.8, None),
+                Cmd::Fit => self.fit(),
+                Cmd::SidePanel => self.prefs.panel_open = !self.prefs.panel_open,
+                Cmd::Shortcuts => self.help_open = true,
+                Cmd::Welcome => self.show_onboarding(),
+                Cmd::Website => update::open_url("https://alidevecioglu.github.io/OpenCeres/"),
+                Cmd::ReportProblem => {
+                    update::open_url("https://github.com/alidevecioglu/OpenCeres/issues")
+                }
+            }
+        }
+        let has_set = self.set.is_some();
+        let blink = self.frame_count() > 1;
+        let idle = self.loading.is_none();
+        menubar::sync(|cmd| match cmd {
+            Cmd::Open | Cmd::OpenFolder => (idle, false),
+            Cmd::History => (true, self.searches.window_open),
+            Cmd::Play => (blink, self.playing),
+            Cmd::PrevFrame | Cmd::NextFrame | Cmd::Slower | Cmd::Faster => (blink, false),
+            Cmd::Stars => (true, self.show_stars),
+            Cmd::Invert => (true, self.invert),
+            Cmd::Align => (true, self.align_on),
+            Cmd::Grid => (self.prefs.box_report, self.grid_on),
+            Cmd::Known => (true, self.known_on),
+            Cmd::Mark => (has_set, self.marking.is_some()),
+            Cmd::ExportJson => (self.can_export(), false),
+            Cmd::ImportJson | Cmd::ReviewReport => (has_set, false),
+            Cmd::ZoomIn | Cmd::ZoomOut | Cmd::Fit => (has_set, false),
+            Cmd::SidePanel => (true, self.prefs.panel_open),
+            _ => (true, false),
+        });
+    }
+
+    /// The set's name, cut with … when narrow; the summary is in its
+    /// tooltip and the panel's header.
     fn set_info(&self, ui: &mut egui::Ui) {
         let p = palette(ui);
         let Some(set) = &self.set else {
@@ -1340,46 +1515,17 @@ impl App {
             }
             return;
         };
-        let name = if set.name.is_empty() {
-            "Image set"
-        } else {
-            set.name.as_str()
-        };
-        let mut job = LayoutJob::default();
-        let format = |size: f32, color: Color32| TextFormat {
-            font_id: FontId::proportional(size),
-            color,
-            valign: Align::Center,
-            ..Default::default()
-        };
-        job.append(name, 0.0, format(13.0, p.text));
-        job.append(&set.summary, S3, format(12.0, p.muted));
-        ui.add(Label::new(job).truncate())
-            .on_hover_text(format!("{name} · {}", set.summary));
+        ui.add(Label::new(set_title(set, p, false)).truncate())
+            .on_hover_text(format!("{} · {}", set_name(set), set.summary));
     }
 
-    /// `‹ ⏯ ›  2 / 4   − 0.5 s +`, added right to left.
+    /// `‹ ⏯ ›  2 / 4   tortoise 0.50 s hare`, added right to left.
     fn blink_controls(&mut self, ui: &mut egui::Ui) {
         let p = palette(ui);
         let now = ui.input(|i| i.time);
-        let speed_tip = "Seconds per frame ( , slower · . faster )";
-        let secs = self.blink_seconds;
-        if icons::button(ui, Icon::Plus, false, secs > SPEEDS[0])
-            .on_hover_text("Faster: shorter time on each frame (.)")
-            .clicked()
-        {
-            self.change_speed(-1, now);
-        }
-        ui.add_sized(
-            vec2(40.0, theme::TOOL),
-            Label::new(RichText::new(format!("{secs} s")).color(p.text)),
-        )
-        .on_hover_text(speed_tip);
-        if icons::button(ui, Icon::Minus, false, secs < SPEEDS[SPEEDS.len() - 1])
-            .on_hover_text("Slower: longer time on each frame (,)")
-            .clicked()
-        {
-            self.change_speed(1, now);
+        let mut secs = self.blink_seconds;
+        if speed::toolbar(ui, &mut secs, &mut self.speed_open) {
+            self.set_speed(secs, now);
         }
         ui.add_space(S3);
         let n = self.frame_count();
@@ -1433,9 +1579,10 @@ impl App {
         {
             self.set_known(!self.known_on);
         }
-        if icons::button(ui, Icon::Grid, self.grid_on, true)
-            .on_hover_text("Report grid (G)")
-            .clicked()
+        if self.prefs.box_report
+            && icons::button(ui, Icon::Grid, self.grid_on, true)
+                .on_hover_text("Report grid (G)")
+                .clicked()
         {
             self.set_grid(!self.grid_on);
         }
@@ -1532,7 +1679,7 @@ impl App {
                                         .color(p.danger),
                                 );
                             }
-                            if matches!(self.known, Some(KnownState::Pending(_))) {
+                            if matches!(self.known, Some(KnownState::Pending { .. })) {
                                 ui.label(small("Looking up known objects…".into()));
                                 ui.add(egui::Spinner::new().size(11.0).color(p.muted));
                             }
@@ -1554,75 +1701,213 @@ impl App {
                 left: S4 as i8,
                 right: S4 as i8,
                 top: S3 as i8,
-                bottom: S3 as i8,
+                bottom: S2 as i8,
             }))
             .show(ui, |ui| {
-                // Scrolls when the sections don't fit (small windows).
-                egui::ScrollArea::vertical()
-                    .id_salt("panel_scroll")
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| self.panel_sections(ui, frame));
+                // The footer stays at the bottom; the sections above it
+                // scroll when they don't fit (small windows).
+                ui.with_layout(Layout::bottom_up(Align::Min), |ui| {
+                    if self.set.is_some() {
+                        self.panel_footer(ui, frame);
+                        ui.add_space(S1);
+                        hline(ui, p.border);
+                        ui.add_space(S1);
+                    }
+                    ui.with_layout(Layout::top_down(Align::Min), |ui| {
+                        egui::ScrollArea::vertical()
+                            .id_salt("panel_scroll")
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| self.panel_sections(ui));
+                    });
+                });
             });
     }
 
-    fn panel_sections(&mut self, ui: &mut egui::Ui, frame: &eframe::Frame) {
+    /// Always in this order: the set, Objects, the IASC report, Known
+    /// objects; then Team, Imported reports and the box report only when
+    /// they apply. One accent button at a time: Mark object until there is
+    /// an object to report, Done while marking, then Review & copy report.
+    fn panel_sections(&mut self, ui: &mut egui::Ui) {
         let p = palette(ui);
         ui.spacing_mut().item_spacing.y = S2;
-        let count = (!self.marks.is_empty()).then_some(self.marks.len());
-        section_heading(ui, "Easy report", count);
-        self.report_section(ui);
-        ui.add_space(S3);
-        hline(ui, p.border);
-        ui.add_space(S2);
+        let gap = |ui: &mut egui::Ui| {
+            ui.add_space(S2);
+            hline(ui, p.border);
+            ui.add_space(S1);
+        };
+        let Some(set) = &self.set else {
+            muted_wrapped(ui, "Open an image set to start.");
+            return;
+        };
+        ui.add(Label::new(set_title(set, p, true)).truncate())
+            .on_hover_text(format!("{} · {}", set_name(set), set.summary));
+        gap(ui);
         let count = (!self.objects.is_empty()).then_some(self.objects.len());
         section_heading(ui, "Objects", count);
-        self.objects_section(ui, frame);
-        if self.team_has_section() {
-            ui.add_space(S3);
-            hline(ui, p.border);
-            ui.add_space(S2);
-            self.team_section(ui);
-        }
-        if self.set.is_some() && self.searches.record.is_some() {
-            ui.add_space(S3);
-            hline(ui, p.border);
-            ui.add_space(S2);
-            self.search_section(ui);
-        }
+        self.objects_section(ui);
+        gap(ui);
+        section_heading(ui, "Report for IASC", None);
+        self.mpc_section(ui);
         if self.known_on {
-            ui.add_space(S3);
-            hline(ui, p.border);
-            ui.add_space(S2);
-            let count = match &self.known {
-                Some(KnownState::Done(k)) => Some(k.objects.len()),
-                _ => None,
-            };
-            section_heading(ui, "Known objects", count);
+            gap(ui);
             self.known_section(ui);
         }
-        if self.set.is_some() {
-            ui.add_space(S3);
-            hline(ui, p.border);
-            ui.add_space(S2);
-            let count = (!self.reviews.is_empty()).then_some(self.reviews.len());
-            section_heading(ui, "Students' reports", count);
-            self.reviews_section(ui, frame);
+        if self.team_has_section() {
+            gap(ui);
+            self.team_section(ui);
         }
-        ui.add_space(S3);
-        hline(ui, p.border);
-        ui.add_space(S2);
-        section_heading(ui, "Candidates", None);
-        ui.add(
-            Label::new(
-                RichText::new(
-                    "Automatic detection is coming. For now, blink and look for \
-                     anything that moves.",
-                )
-                .small()
-                .color(p.muted),
-            )
-            .wrap(),
+        if !self.reviews.is_empty() {
+            gap(ui);
+            section_heading(ui, "Imported reports", Some(self.reviews.len()));
+            self.reviews_section(ui);
+        } else if let Some(n) = &self.review_note {
+            ui.add(Label::new(RichText::new(n).small().color(p.muted)).wrap());
+        }
+        if self.prefs.box_report {
+            gap(ui);
+            let count = (!self.marks.is_empty()).then_some(self.marks.len());
+            section_heading(ui, "Box report", count);
+            self.report_section(ui);
+        }
+    }
+
+    /// `Saved ✓   Notes  ⋯`: the search saves itself; notes and the rest
+    /// of what can be done with it are one click away.
+    fn panel_footer(&mut self, ui: &mut egui::Ui, frame: &eframe::Frame) {
+        let p = palette(ui);
+        ui.allocate_ui_with_layout(
+            vec2(ui.available_width(), theme::TOOL),
+            Layout::left_to_right(Align::Center),
+            |ui| {
+                ui.spacing_mut().item_spacing.x = S1;
+                self.saved_state(ui);
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    let more = icons::button(ui, Icon::More, false, true)
+                        .on_hover_text("Export, import, new search, history");
+                    egui::Popup::menu(&more)
+                        .align(egui::RectAlign::TOP_END)
+                        .show(|ui| self.more_menu(ui, frame));
+                    let has_notes = self
+                        .searches
+                        .record
+                        .as_ref()
+                        .is_some_and(|r| !r.notes.trim().is_empty());
+                    let color = if has_notes { p.accent } else { p.text };
+                    let notes = ui
+                        .add_enabled(
+                            self.searches.record.is_some(),
+                            Button::new(RichText::new("Notes").color(color))
+                                .frame_when_inactive(false)
+                                .min_size(vec2(0.0, theme::TOOL)),
+                        )
+                        .on_hover_text(if has_notes {
+                            "Your notes on this search"
+                        } else {
+                            "Add notes to this search"
+                        });
+                    egui::Popup::from_toggle_button_response(&notes)
+                        .align(egui::RectAlign::TOP_END)
+                        .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+                        .width(240.0)
+                        .show(|ui| {
+                            if let Some(r) = &mut self.searches.record {
+                                ui.add(
+                                    egui::TextEdit::multiline(&mut r.notes)
+                                        .hint_text("Notes, saved with the search")
+                                        .desired_rows(4)
+                                        .desired_width(240.0),
+                                )
+                                .request_focus();
+                            }
+                        });
+                });
+            },
         );
+    }
+
+    /// The ⋯ menu at the foot of the panel.
+    fn more_menu(&mut self, ui: &mut egui::Ui, frame: &eframe::Frame) {
+        let can_export = self.can_export();
+        if ui
+            .add_enabled(can_export, Button::new("Export as JSON…"))
+            .on_hover_text("Your search with each object's positions and its MPC report")
+            .clicked()
+        {
+            self.export_json(ui.ctx(), frame, false);
+        }
+        if ui
+            .add_enabled(can_export, Button::new("Export as JSON with cutouts…"))
+            .on_hover_text(
+                "Also small pictures of each object on every frame, so others can check \
+                 without the images",
+            )
+            .clicked()
+        {
+            self.export_json(ui.ctx(), frame, true);
+        }
+        if ui
+            .button("Import JSON…")
+            .on_hover_text("Show the objects in a search exported from OpenCeres for this set")
+            .clicked()
+        {
+            self.import_report(frame);
+        }
+        ui.separator();
+        let fresh = self
+            .searches
+            .record
+            .as_ref()
+            .is_some_and(history::Record::has_content)
+            && self.marking.is_none();
+        if ui
+            .add_enabled(fresh, Button::new("Start a new search"))
+            .on_hover_text("Keep this search in the history and start again on this set")
+            .clicked()
+        {
+            self.start_new_search();
+        }
+        if ui.button("Open history").clicked() {
+            self.toggle_history();
+        }
+        if self.team_has_section() && ui.button("Refresh team findings").clicked() {
+            self.team_fetch_findings();
+        }
+    }
+
+    /// `Saved ✓`, or why not, with the search's story in the tooltip.
+    fn saved_state(&self, ui: &mut egui::Ui) {
+        let p = palette(ui);
+        let h = &self.searches;
+        let Some(r) = &h.record else { return };
+        let (text, icon, color) = if h.error.is_some() {
+            ("Not saved", Icon::Close, p.danger)
+        } else if h.saved.is_some() {
+            ("Saved", Icon::Check, p.success)
+        } else {
+            ("Saves as you work", Icon::History, p.muted)
+        };
+        let mut tip = match &h.error {
+            Some(e) => e.clone(),
+            None => "Saved in the search history as you work (H)".to_owned(),
+        };
+        if let Some(t) = h.resumed {
+            tip += &format!("\nContinued from {}", format::unix_utc(t));
+        }
+        if !h.others.is_empty() {
+            tip += &format!("\nAlso searched by {}", h.others.join(", "));
+        }
+        if !r.searched_by.trim().is_empty() {
+            tip += &format!("\nMeasured by {}", r.searched_by.trim());
+        }
+        let row = ui
+            .horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = S1;
+                ui.label(RichText::new(text).small().color(p.muted));
+                let (rect, _) = ui.allocate_exact_size(vec2(14.0, 14.0), Sense::hover());
+                icons::paint(ui.painter(), rect, icon, color);
+            })
+            .response;
+        row.on_hover_text(tip);
     }
 
     fn report_section(&mut self, ui: &mut egui::Ui) {
@@ -1787,10 +2072,15 @@ impl App {
         if let Some(pos) = pick {
             let uv = (pos - rect.min - self.view.offset) / self.view.scale;
             if uv.x >= 0.0 && uv.y >= 0.0 && uv.x < w && uv.y < h {
+                let (x, y) = (f64::from(uv.x) - 0.5, f64::from(h - uv.y) - 0.5);
                 if self.marking.is_some() {
-                    self.place_mark(f64::from(uv.x) - 0.5, f64::from(h - uv.y) - 0.5);
-                } else {
+                    self.place_mark(x, y);
+                } else if self.prefs.box_report && self.grid_on {
                     self.toggle_mark(uv.x / w, uv.y / h);
+                } else {
+                    // A plain click starts a new object there, on this frame.
+                    self.start_marking();
+                    self.place_mark(x, y);
                 }
             }
         }
@@ -1940,45 +2230,109 @@ impl App {
         }
     }
 
+    /// One line, `▸ Known objects  3  MPCORB`, that opens into the list.
     fn known_section(&mut self, ui: &mut egui::Ui) {
         let p = palette(ui);
-        if self.set.is_none() {
-            muted_wrapped(ui, "Open an image set first.");
+        let pending = match &self.known {
+            Some(KnownState::Pending {
+                started, source, ..
+            }) => Some((started.elapsed().as_secs(), *source)),
+            _ => None,
+        };
+        let (count, status, status_color) = match &self.known {
+            None => (None, "Looking up…".to_owned(), p.muted),
+            Some(KnownState::Pending { .. }) => (
+                None,
+                format!("Looking up… {} s", pending.map_or(0, |p| p.0)),
+                p.muted,
+            ),
+            Some(KnownState::Done(k)) => {
+                (Some(k.objects.len()), k.source.short().to_owned(), p.muted)
+            }
+            Some(KnownState::Failed(_)) => (None, "Failed".to_owned(), p.danger),
+            Some(KnownState::NoCatalogue) => (None, "No catalogue".to_owned(), p.warning),
+        };
+        let header = known_header(
+            ui,
+            self.known_expanded,
+            count,
+            &status,
+            status_color,
+            pending.is_some(),
+        );
+        let tip = match &self.known {
+            Some(KnownState::Done(k)) => {
+                let source = match (&k.source, &k.catalogue) {
+                    (KnownSource::Mpcorb, Some(date)) => format!("MPCORB of {date}"),
+                    (s, _) => s.short().to_owned(),
+                };
+                format!(
+                    "Known asteroids and comets from {source}, looked up {}",
+                    k.at
+                )
+            }
+            _ => "Known asteroids and comets in the field (K)".to_owned(),
+        };
+        if header.on_hover_text(tip).clicked() {
+            self.known_expanded = !self.known_expanded;
+        }
+        if let Some((seconds, source)) = pending {
+            // The seconds count up without a busy repaint loop.
+            ui.ctx().request_repaint_after(Duration::from_secs(1));
+            if source == KnownSource::SkyBot && seconds >= 8 {
+                let mut offline = false;
+                ui.horizontal_wrapped(|ui| {
+                    ui.spacing_mut().item_spacing.x = S1;
+                    ui.label(RichText::new("SkyBoT is slow —").small().color(p.muted));
+                    offline = ui
+                        .link(
+                            RichText::new("use the offline catalogue")
+                                .small()
+                                .color(p.accent),
+                        )
+                        .on_hover_text("MPCORB, searched on this computer")
+                        .clicked();
+                });
+                if offline {
+                    self.use_offline_catalogue();
+                }
+            }
+        }
+        if !self.known_expanded {
             return;
         }
         match &self.known {
-            None | Some(KnownState::Pending(_)) => {
-                ui.horizontal(|ui| {
-                    ui.add(egui::Spinner::new().size(13.0).color(p.muted));
-                    ui.label(RichText::new("Looking up known objects…").color(p.muted));
-                });
-            }
+            None | Some(KnownState::Pending { .. }) => {}
             Some(KnownState::Failed(e)) => {
-                ui.add(Label::new(RichText::new(e).color(p.danger)).wrap());
-                if ui.button("Try again").clicked() {
+                ui.add(Label::new(RichText::new(e).small().color(p.danger)).wrap());
+                if ui
+                    .link(RichText::new("Try again").small().color(p.accent))
+                    .clicked()
+                {
                     self.known = None;
                 }
             }
             Some(KnownState::NoCatalogue) => {
-                muted_wrapped(
-                    ui,
-                    "The offline MPCORB catalogue isn't on this computer yet. Download it \
-                     once (about 94 MB), or use SkyBoT online.",
-                );
-                self.download_controls(ui);
-                if self.download.is_none()
-                    && ui
-                        .button("Use SkyBoT instead")
-                        .on_hover_text("Changes the source in Settings")
+                ui.horizontal_wrapped(|ui| {
+                    ui.spacing_mut().item_spacing.x = S1;
+                    ui.label(
+                        RichText::new("MPCORB isn't here yet.")
+                            .small()
+                            .color(p.muted),
+                    );
+                    if ui
+                        .link(RichText::new("Download…").small().color(p.accent))
+                        .on_hover_text("Settings → Known objects (about 94 MB)")
                         .clicked()
-                {
-                    self.prefs.known_source = KnownSource::SkyBot;
-                }
+                    {
+                        self.open_settings(Category::Known);
+                    }
+                });
             }
             Some(KnownState::Done(k)) => {
                 let mut clicked = None;
                 if k.objects.is_empty() {
-                    muted_wrapped(ui, "No known asteroids or comets in this field.");
+                    muted_wrapped(ui, "None in this field.");
                 } else {
                     let max = (ui.available_height() - 120.0).max(120.0);
                     egui::ScrollArea::vertical()
@@ -1996,38 +2350,20 @@ impl App {
                             }
                         });
                 }
-                let source = match (&k.source, &k.catalogue) {
-                    (KnownSource::Mpcorb, Some(date)) => format!("MPCORB of {date}"),
-                    (s, _) => s.short().to_owned(),
-                };
-                ui.add_space(S1);
-                ui.label(
-                    RichText::new(format!("{source} · looked up {}", k.at))
-                        .small()
-                        .color(p.muted),
-                );
-                let mut open = false;
-                if k.source == KnownSource::Mpcorb && self.mpcorb_newer {
-                    ui.horizontal(|ui| {
-                        ui.spacing_mut().item_spacing.x = S1;
-                        ui.label(
-                            RichText::new("Newer catalogue available")
-                                .small()
-                                .color(p.accent),
-                        );
-                        open = ui
-                            .link(RichText::new("Update…").small().color(p.accent))
-                            .on_hover_text("Settings → Known objects")
-                            .clicked();
-                    });
-                }
-                if open {
-                    self.open_settings(Category::Known);
-                }
                 if let Some(i) = clicked {
                     self.focus_known(i);
                 }
             }
+        }
+    }
+
+    /// "SkyBoT is slow": look up from MPCORB when it is here, else show
+    /// where to download it.
+    fn use_offline_catalogue(&mut self) {
+        if known::catalogue_path().is_some_and(|p| p.is_file()) {
+            self.prefs.known_source = KnownSource::Mpcorb;
+        } else {
+            self.open_settings(Category::Known);
         }
     }
 
@@ -2348,6 +2684,8 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         let now = ctx.input(|i| i.time);
+        let fullscreen = ctx.input(|i| i.viewport().fullscreen.unwrap_or(false));
+        titlebar::place_window_buttons(frame, theme::TOOLBAR_HEIGHT, fullscreen);
         self.apply_theme(&ctx);
         self.poll_loading(now);
         self.poll_download();
@@ -2360,6 +2698,7 @@ impl eframe::App for App {
         self.poll_known();
         self.ensure_known(&ctx);
         self.poll_export();
+        self.poll_mpc(&ctx);
         self.poll_team();
         self.drive_capture(&ctx);
         if let Some(e) = self.gpu.take_error() {
@@ -2376,6 +2715,7 @@ impl eframe::App for App {
             self.open(&ctx, dropped);
         }
         self.handle_keys(&ctx, frame);
+        self.menu_commands(&ctx, frame, now);
         self.tick_blink(&ctx);
 
         self.toolbar(ui, frame);
@@ -2388,7 +2728,9 @@ impl eframe::App for App {
             .rect;
         self.offers_box(&ctx, stage);
         self.settings_window(&ctx, now);
+        self.onboarding_window(&ctx);
         self.history_window(&ctx, frame);
+        self.mpc_window(&ctx, frame);
         self.team_window(&ctx);
         self.autosave();
 
@@ -2468,6 +2810,126 @@ fn place(lookup: Lookup, frames: &[ImageFrame]) -> KnownField {
         at: lookup.at,
         catalogue: lookup.catalogue,
     }
+}
+
+fn set_name(set: &Set) -> &str {
+    if set.name.is_empty() {
+        "Image set"
+    } else {
+        set.name.as_str()
+    }
+}
+
+/// The set's name, and with `summary` its frames, size and time span in
+/// muted text, for one truncated line.
+fn set_title(set: &Set, p: &theme::Palette, summary: bool) -> LayoutJob {
+    let mut job = LayoutJob::default();
+    let format = |size: f32, color: Color32, family: egui::FontFamily| TextFormat {
+        font_id: FontId::new(size, family),
+        color,
+        valign: Align::Center,
+        ..Default::default()
+    };
+    job.append(
+        set_name(set),
+        0.0,
+        format(13.0, p.text, egui::FontFamily::Proportional),
+    );
+    if summary {
+        job.append(
+            &set.summary,
+            S2,
+            format(12.0, p.muted, egui::FontFamily::Proportional),
+        );
+    }
+    job
+}
+
+/// `▸ Known objects  3        MPCORB`: the whole line opens and closes
+/// the section.
+fn known_header(
+    ui: &mut egui::Ui,
+    open: bool,
+    count: Option<usize>,
+    status: &str,
+    status_color: Color32,
+    busy: bool,
+) -> Response {
+    let p = palette(ui);
+    let (rect, response) = ui.allocate_exact_size(vec2(ui.available_width(), 22.0), Sense::click());
+    let painter = ui.painter();
+    if response.hovered() || response.has_focus() {
+        painter.rect_filled(rect.expand2(vec2(S1, 0.0)), theme::RADIUS, p.hover);
+    }
+    // The caret: right when closed, down when open.
+    let c = pos2(rect.min.x + 5.0, rect.center().y);
+    let tri = if open {
+        vec![
+            c + vec2(-4.0, -2.0),
+            c + vec2(4.0, -2.0),
+            c + vec2(0.0, 3.0),
+        ]
+    } else {
+        vec![
+            c + vec2(-2.0, -4.0),
+            c + vec2(3.0, 0.0),
+            c + vec2(-2.0, 4.0),
+        ]
+    };
+    painter.add(Shape::convex_polygon(tri, p.muted, Stroke::NONE));
+    let title = painter.layout_no_wrap(
+        "Known objects".to_owned(),
+        FontId::new(13.0, theme::semibold()),
+        p.text,
+    );
+    let mut x = rect.min.x + 14.0;
+    painter.galley(
+        pos2(x, rect.center().y - title.size().y / 2.0),
+        title.clone(),
+        p.text,
+    );
+    x += title.size().x + S2;
+    if let Some(n) = count {
+        let g = painter.layout_no_wrap(n.to_string(), FontId::proportional(11.0), p.accent);
+        let chip = Rect::from_min_size(
+            pos2(x, rect.center().y - 8.0),
+            vec2(g.size().x + 12.0, 16.0),
+        );
+        painter.rect_filled(chip, 8.0, p.accent_weak);
+        painter.galley(
+            pos2(chip.min.x + 6.0, chip.center().y - g.size().y / 2.0),
+            g,
+            p.accent,
+        );
+        x = chip.max.x + S2;
+    }
+    let mut status =
+        painter.layout_no_wrap(status.to_owned(), FontId::proportional(12.0), status_color);
+    let spinner = if busy { 12.0 + S1 } else { 0.0 };
+    let room = rect.max.x - x - spinner;
+    if status.size().x > room {
+        // Only the seconds when "Looking up…" doesn't fit.
+        let short = status
+            .text()
+            .rsplit("… ")
+            .next()
+            .unwrap_or_default()
+            .to_owned();
+        status = painter.layout_no_wrap(short, FontId::proportional(12.0), status_color);
+    }
+    let at = pos2(
+        rect.max.x - status.size().x,
+        rect.center().y - status.size().y / 2.0,
+    );
+    painter.galley(at, status, status_color);
+    if busy {
+        let r = Rect::from_center_size(pos2(at.x - S1 - 6.0, rect.center().y), vec2(12.0, 12.0));
+        egui::Spinner::new()
+            .size(12.0)
+            .color(p.muted)
+            .paint_at(ui, r);
+    }
+    response.on_hover_cursor(CursorIcon::PointingHand)
 }
 
 /// `133105 · 19.0`, the label drawn next to a known object.

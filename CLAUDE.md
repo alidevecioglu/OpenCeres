@@ -53,27 +53,68 @@ objects, measure positions, write MPC reports. Product priorities, in order:
 ## Layout
 
 - `crates/core/src/` — `fits` (reader), `detect` (background, sources,
-  windowed centroids), `align` (star matching between frames for the
-  blink), `wcs` (TAN projection), `time` (JD ↔ calendar),
-  `mpc` (80-column format), `render` (display stretch).
-- `crates/cli/` — `openceres info|stars` for checking the core on real files.
+  windowed centroids with error propagation), `align` (star matching between
+  frames for the blink), `wcs` (header TAN projection), `time` (JD ↔
+  calendar; mid-exposure incl. Pan-STARRS SHMD*UTC), `mpc` (80-column lines,
+  header lines, name/designation checks), `ades` (ADES 2022 PSV), `render`
+  (display stretch).
+- Report pipeline in core: `gaia` (VizieR I/355/gaiadr3 URLs + ASU-TSV
+  parser; a mirror counts only if the reply holds Gaia rows; proper motion
+  from J2016.0), `plate` (plate-constant polynomial in pixels → standard
+  coordinates, order 1–3 chosen by 5-fold cross-validation, offset vote then
+  triangle fallback for matching, `model_sigma` from (AᵀA)⁻¹), `photometry`
+  (annulus sky, exact-area aperture, Gaia-G zero point; band `G`), `reduce`
+  (one frame: detect → solve → zero point → measure marks). On IASC XY57
+  frames: order 2, ~45 stars, 0.02–0.03″ RMS; header WCS is 1.3–7″ off.
+- `crates/cli/` — `openceres info|stars|known|align|solve`; `solve` fetches
+  Gaia with curl (or `--gaia file.tsv`) and prints fit, CV RMS per order,
+  zero point and `--mark x,y` measurements.
 - `crates/desktop/src/history.rs` — search history: one JSON file per search
   (id = file name, so imported ids are validated), merge-by-id import,
   CSV/JSON export. UI in `app/history_ui.rs`; `json.rs` is the shared
   hand-written parser/writer. Screenshots only touch the history when
   `OPENCERES_HISTORY_DIR` is set.
-- `crates/desktop/src/app/objects_ui.rs` — detailed report: students mark
-  each moving object frame by frame (snap to sources, predicted position),
-  export the search as JSON with or without PNG cutouts; teachers import
-  students' reports and see their tracks on the open set. Marks are stored
+- `crates/desktop/src/app/objects_ui.rs` — detailed report: each moving
+  object is marked frame by frame (snap to sources, predicted position;
+  a plain click on the image starts one), one panel line per object; the
+  search exports as JSON with or without PNG cutouts, and imported reports
+  show their tracks on the open set. The side panel (`app.rs`
+  `panel_sections`) has a fixed order — set, Objects, Report for IASC,
+  Known objects (one collapsible line) — then Team / Imported reports /
+  Box report only when they apply, and a footer (Saved, Notes, ⋯ menu);
+  one accent button at a time, no text fields in the panel. Marks are stored
   in each frame's own pixels plus `frames` (file, DATE-OBS) so they map onto
   another computer's copy of the set.
+- `crates/desktop/src/i18n.rs` — translations: `locales/<code>.txt`
+  (`key = text`, `{name}` placeholders, embedded with `include_str!`),
+  `tr("key")` / `tr_args("key", &[("name", v)])`, global language from
+  `prefs.language`; falls back to English, then to the key. Tests check the
+  files, placeholders and that `en.txt` has exactly the keys the code uses
+  (literal `tr("…")` calls; `setting.<id>` keys translate registry labels).
+  New UI text goes through `tr`; `TRANSLATING.md` is the translators' guide.
+- `crates/desktop/src/app/onboarding_ui.rs` — the welcome window, shown
+  until `prefs.onboarded`; reopened from Help → Welcome… and Settings →
+  General. Reuses the Settings rows and the MPCORB download; captures show
+  it only with `onboarding[=STEP]`.
 - `crates/desktop/` — the desktop app: egui/eframe with the glow (OpenGL)
   backend, no web technology (user requirement: minimum resource use).
   Frames are R8 textures drawn by a small shader (invert is a uniform);
   reactive repaint only, idle CPU must stay ~0 %. Loads `PARALLEL` (2) frames
   at a time to bound peak memory. Measure RSS/footprint and binary size when
   changing dependencies or the loading path.
+- MPC report in the app: `gaia.rs` (curl fetch, mirror order/fallback, cache
+  in `<data>/Gaia/`, Settings mirror tests), `measure.rs` (background job:
+  re-reads frames, runs `core::reduce`, keyed on marks + catalogue),
+  `report.rs` (team details in `<data>/report.txt`, designations, checks,
+  80-col + ADES text; `ALLOW_PREVIEW_COPY` = false: no copy without Gaia),
+  UI in `app/mpc_ui.rs` (panel "Report for IASC", review window, Settings →
+  Observer & report and the mirror rows). "Measured by" is the search's
+  `searched_by`. Screenshots: `review`, `mpc=fetching|measuring|offline|
+  failed|preview|missing|ready`.
+- `crates/desktop/src/titlebar.rs`, `menubar.rs` — macOS only: the toolbar is
+  the title bar (window buttons moved onto it, empty space drags), and a
+  native menu bar whose items run the same actions as the keys. Only ⌘
+  shortcuts go in the menu; plain-letter key equivalents would steal typing.
 
 ## Roadmap
 

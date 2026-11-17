@@ -5,13 +5,18 @@
 //! stored in the file. FITS uses 1-based coordinates, so FITS (1, 1) is our
 //! (0, 0); the conversion happens only inside [`wcs`].
 
+pub mod ades;
 pub mod align;
 pub mod detect;
 pub mod ephem;
 pub mod fits;
+pub mod gaia;
 pub mod known;
 pub mod mpc;
 pub mod orbit;
+pub mod photometry;
+pub mod plate;
+pub mod reduce;
 pub mod render;
 pub mod time;
 pub mod wcs;

@@ -6,18 +6,25 @@
 mod app;
 mod capture;
 mod format;
+mod gaia;
 mod gpu;
 mod gz;
 mod history;
+mod i18n;
 mod icons;
 mod json;
 mod known;
 mod load;
+mod measure;
+mod menubar;
 mod png;
 mod prefs;
+mod report;
 mod settings;
+mod speed;
 mod team;
 mod theme;
+mod titlebar;
 mod update;
 mod zip;
 
@@ -40,7 +47,8 @@ fn main() -> eframe::Result {
     #[cfg(not(target_os = "macos"))]
     let viewport = viewport.with_icon(window_icon());
     let options = eframe::NativeOptions {
-        viewport: viewport
+        // macOS: the toolbar is the title bar (`titlebar.rs`).
+        viewport: titlebar::unified(viewport)
             .with_title("OpenCeres")
             .with_app_id("org.openceres.desktop")
             .with_inner_size(size)

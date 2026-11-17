@@ -304,24 +304,39 @@ pub fn cutouts(
     paths: &[String],
     requests: &[CutoutRequest],
 ) -> Result<Vec<Option<Vec<u8>>>, String> {
-    let (_, sources) = collect(paths)?;
     let mut out: Vec<Option<Vec<u8>>> = requests.iter().map(|_| None).collect();
+    let names: Vec<String> = requests.iter().map(|r| r.file.clone()).collect();
+    for_each_image(paths, &names, |name, image| {
+        let gray = render::grayscale(&image, render::Stretch::auto(detect::background(&image)));
+        for (slot, r) in out.iter_mut().zip(requests).filter(|(_, r)| r.file == name) {
+            *slot = Some(cut(&gray, image.width, image.height, r));
+        }
+    })?;
+    Ok(out)
+}
+
+/// Reads the set's files again, one frame at a time, and hands each frame
+/// named in `names` ([`Frame::name`]) to `f` with its pixels: for work
+/// that needs them after loading (the app keeps none), done rarely.
+pub fn for_each_image(
+    paths: &[String],
+    names: &[String],
+    mut f: impl FnMut(&str, fits::Image),
+) -> Result<(), String> {
+    let (_, sources) = collect(paths)?;
     for source in sources {
         let name = match &source {
             Source::File(p) => file_name(p),
             Source::Bytes(n, _) => n.clone(),
         };
-        if !requests.iter().any(|r| r.file == name) {
+        if !names.contains(&name) {
             continue;
         }
         let (_, image) = read(source)?;
-        let gray = render::grayscale(&image, render::Stretch::auto(detect::background(&image)));
-        for (slot, r) in out.iter_mut().zip(requests).filter(|(_, r)| r.file == name) {
-            *slot = Some(cut(&gray, image.width, image.height, r));
-        }
+        f(&name, image);
     }
     release_freed_memory();
-    Ok(out)
+    Ok(())
 }
 
 fn cut(gray: &[u8], width: usize, height: usize, r: &CutoutRequest) -> Vec<u8> {

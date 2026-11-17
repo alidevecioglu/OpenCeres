@@ -1,9 +1,9 @@
-//! The detailed report: students mark each moving object on every frame
-//! (after the easy report's boxes), see it drawn as a track, and export the
-//! search as JSON, with or without cutouts of what they saw. Teachers open
-//! the same set and import students' reports to see their objects on the
-//! images. The marks live in the search record ([`crate::history`]), so
-//! they are saved as the student works and travel with history exports.
+//! The detailed report: each moving object is marked on every frame, drawn
+//! as a track, and the search exported as JSON, with or without cutouts of
+//! what was seen. Others open the same set and import those reports to see
+//! the objects on their images. The marks live in the search record
+//! ([`crate::history`]), so they are saved while working and travel with
+//! history exports. The side panel shows one line per object.
 
 use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, TryRecvError};
@@ -15,8 +15,9 @@ use eframe::egui::{
 use openceres_core::align::Affine;
 
 use super::history_ui::known_name;
-use super::{App, KnownState, muted_wrapped};
+use super::{App, KnownState};
 use crate::history::{self, FrameRef, Record, Tagged, object_label};
+use crate::icons::{self, Icon};
 use crate::load::{self, CutoutRequest};
 use crate::theme::{self, S1, S2, S3, palette};
 use crate::{png, update};
@@ -75,8 +76,10 @@ impl Snap {
     fn text(self) -> &'static str {
         match self {
             Snap::Source => "Snapped to a detected source",
-            Snap::Clicked => "No source nearby: placed where you clicked. Zoom in for accuracy.",
-            Snap::Predicted => "No source nearby: placed at the predicted spot.",
+            Snap::Clicked => {
+                "No source nearby: placed where you clicked (dashed ring). Zoom in for accuracy."
+            }
+            Snap::Predicted => "No source nearby: placed at the predicted spot (dashed ring).",
         }
     }
 }
@@ -133,14 +136,16 @@ impl App {
         self.objects.push(Tagged {
             label,
             at: vec![None; n],
+            unsnapped: vec![false; n],
             ..Tagged::default()
         });
         // The new object may take a deleted object's label.
         self.undo = None;
         self.snap = None;
         self.marking = Some(self.objects.len() - 1);
+        // From the frame on screen: the object was probably just seen there.
+        self.mark_visited = vec![false; n];
         self.playing = false;
-        self.index = 0;
         self.prefs.panel_open = true;
     }
 
@@ -151,12 +156,12 @@ impl App {
             return;
         }
         let Some(o) = self.objects.get(i) else { return };
+        self.mark_visited = vec![false; o.at.len()];
         self.editing = Some(o.clone());
         self.marking = Some(i);
         self.snap = None;
         self.report_note = None;
         self.playing = false;
-        self.index = 0;
         self.prefs.panel_open = true;
     }
 
@@ -202,6 +207,8 @@ impl App {
             && let Some(slot) = o.at.get_mut(i)
         {
             *slot = Some(at);
+            o.unsnapped.resize(o.at.len(), false);
+            o.unsnapped[i] = snapped.is_none();
         }
         self.next_unmarked();
     }
@@ -222,18 +229,32 @@ impl App {
         {
             *slot = None;
         }
+        if let Some(o) = self.marking.and_then(|m| self.objects.get_mut(m))
+            && let Some(u) = o.unsnapped.get_mut(self.index)
+        {
+            *u = false;
+        }
         self.snap = None;
         self.next_unmarked();
     }
 
-    /// Goes to the next frame still to mark (when editing, simply the next
-    /// frame: all of them are marked), or finishes.
+    /// Goes on to the next frame still to mark, in order and wrapping
+    /// round (when editing, the next frame not yet visited: all are
+    /// marked), or finishes when every frame has had its turn.
     pub(super) fn next_unmarked(&mut self) {
         let Some(o) = self.marking.and_then(|m| self.objects.get(m)) else {
             return;
         };
+        let n = o.at.len();
+        self.mark_visited.resize(n, false);
+        if let Some(v) = self.mark_visited.get_mut(self.index) {
+            *v = true;
+        }
         let editing = self.editing.is_some();
-        match (self.index + 1..o.at.len()).find(|&j| editing || o.at[j].is_none()) {
+        let next = (1..n)
+            .map(|k| (self.index + k) % n)
+            .find(|&j| !self.mark_visited[j] && (editing || o.at[j].is_none()));
+        match next {
             Some(j) => self.index = j,
             None => self.finish_marking(),
         }
@@ -489,6 +510,14 @@ impl App {
                     painter.line_segment(segment, Stroke::new(1.0, color.gamma_multiply(ov.track)));
                 }
             }
+            // A mark not on a detected source is dashed: worth a second look.
+            let pattern_at = |i: usize| {
+                if pattern == RingPattern::Solid && o.unsnapped.get(i).copied().unwrap_or(false) {
+                    RingPattern::Dashed
+                } else {
+                    pattern
+                }
+            };
             for &(i, c) in &points {
                 if i != self.index {
                     ring(
@@ -498,7 +527,7 @@ impl App {
                         1.0,
                         color.gamma_multiply(ov.past),
                         halo,
-                        pattern,
+                        pattern_at(i),
                     );
                 }
             }
@@ -509,7 +538,7 @@ impl App {
                 return;
             }
             let width = if active { 2.25 } else { 1.75 };
-            ring(painter, c, r, width, color, halo, pattern);
+            ring(painter, c, r, width, color, halo, pattern_at(self.index));
             let text = match who {
                 Some(w) => format!("{} · {w}", o.label),
                 None => o.label.clone(),
@@ -553,7 +582,7 @@ impl App {
         if let Some((x, y)) = self.prediction() {
             let c = origin + vec2(x as f32 + 0.5, h - 0.5 - y as f32) * scale;
             let r = (3.0 * scale).max(9.0);
-            ring(painter, c, r, 1.5, ov.tag, halo, RingPattern::Dashed);
+            ring(painter, c, r, 1.5, ov.tag, halo, RingPattern::Dotted);
         }
     }
 
@@ -574,7 +603,7 @@ impl App {
             o.at.len()
         );
         if self.prediction().is_some() {
-            text += "  ·  Enter: use the dashed ring";
+            text += "  ·  Enter: use the dotted ring";
         }
         text += "  ·  Esc: done";
         let painter = ui.painter_at(rect);
@@ -600,6 +629,15 @@ impl App {
             let below =
                 Rect::from_center_size(pos2(rect.center().x, chip.max.y + S1 + size.y / 2.0), size);
             painter.rect_filled(below, theme::RADIUS, theme::BADGE);
+            if !matches!(snap, Snap::Source) {
+                // Not on a source: the mark (dashed) may be off the centre.
+                painter.rect_stroke(
+                    below,
+                    theme::RADIUS,
+                    Stroke::new(1.5, theme::DARK.warning),
+                    egui::StrokeKind::Inside,
+                );
+            }
             painter.galley(below.min + vec2(S3, S1 + 1.0), galley, theme::OVERLAY_TEXT);
         }
     }
@@ -628,142 +666,40 @@ impl App {
     // ------------------------------------------------------------------
     // Side panel
 
-    /// "Objects": marking, the list of marked objects, and export.
-    pub(super) fn objects_section(&mut self, ui: &mut egui::Ui, frame: &eframe::Frame) {
+    /// "Objects": the object being marked, one line per marked object, and
+    /// Mark object.
+    pub(super) fn objects_section(&mut self, ui: &mut egui::Ui) {
         let p = palette(ui);
-        if self.set.is_none() {
-            muted_wrapped(ui, "Open an image set first.");
-            return;
-        }
         if let Some(o) = self.marking.and_then(|m| self.objects.get(m)) {
             let (label, done) = (o.label.clone(), o.marked());
-            let editing = self.editing.is_some();
-            Frame::new()
-                .fill(p.inset)
-                .corner_radius(theme::RADIUS)
-                .stroke(Stroke::new(1.0, p.tag))
-                .inner_margin(Margin::same(S2 as i8))
-                .show(ui, |ui| {
-                    ui.set_width(ui.available_width());
-                    let (doing, more) = if editing {
-                        (
-                            "Editing",
-                            "A click moves it on this frame and goes to the next. Marks \
-                             you don't change stay. ← → choose another frame.",
-                        )
-                    } else {
-                        (
-                            "Marking",
-                            "Clicks snap to the centre of a detected source nearby. \
-                             ← → choose another frame.",
-                        )
-                    };
-                    ui.label(
-                        RichText::new(format!(
-                            "{doing} {label}: click it on frame {} of {}.",
-                            self.index + 1,
-                            self.frame_count()
-                        ))
-                        .color(p.text),
-                    );
-                    muted_wrapped(ui, more);
-                    // Wraps: the three buttons don't fit the panel side by side.
-                    ui.horizontal_wrapped(|ui| {
-                        if ui
-                            .button("Not on this frame")
-                            .on_hover_text("Too faint, hidden or off the image here")
-                            .clicked()
-                        {
-                            self.skip_frame();
-                        }
-                        let finish = ui
-                            .add_enabled(done >= 2, Button::new("Done"))
-                            .on_hover_text("Finish this object (Esc)")
-                            .on_disabled_hover_text("Mark it on at least two frames");
-                        if finish.clicked() {
-                            self.finish_marking();
-                        }
-                        if editing {
-                            if ui
-                                .button("Cancel")
-                                .on_hover_text("Keep the marks as they were")
-                                .clicked()
-                            {
-                                self.cancel_edit();
-                            }
-                        } else if done < 2 && ui.button("Cancel").clicked() {
-                            self.finish_marking();
-                        }
-                    });
-                });
+            self.marking_card(ui, &label, done);
         } else if self.objects.is_empty() {
-            muted_wrapped(
-                ui,
+            ui.add(
+                Label::new(RichText::new("Click anything that moves.").color(p.muted)).truncate(),
+            )
+            .on_hover_text(
                 "Mark each moving object on every frame. It is saved with your search \
-                 and goes into the detailed report.",
+                     and goes into the report.",
             );
         }
 
-        let mut delete = None;
-        let mut focus = None;
-        let mut edit = None;
+        let mut action = None;
         for (i, o) in self.objects.iter().enumerate() {
             if Some(i) == self.marking {
                 continue;
             }
-            let frames: String =
-                o.at.iter()
-                    .map(|p| if p.is_some() { '●' } else { '○' })
-                    .collect();
-            ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = S1;
-                let text = RichText::new(o.summary()).color(p.tag);
-                if ui
-                    .add(Label::new(text).sense(egui::Sense::click()))
-                    .on_hover_text("Show it")
-                    .clicked()
-                {
-                    focus = Some(i);
-                }
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if ui
-                        .small_button("×")
-                        .on_hover_text("Delete this object")
-                        .clicked()
-                    {
-                        delete = Some(i);
-                    }
-                    ui.label(RichText::new(frames).small().color(p.muted))
-                        .on_hover_text("Frames it is marked on");
-                });
-            });
-            ui.horizontal(|ui| {
-                if let Some(k) = &o.known {
-                    ui.label(RichText::new(format!("Known: {k}")).small().color(p.known));
-                }
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if ui
-                        .add_enabled(
-                            self.marking.is_none(),
-                            egui::Link::new(RichText::new("Edit marks").small().color(p.accent)),
-                        )
-                        .on_hover_text("Move or remove its marks, frame by frame")
-                        .clicked()
-                    {
-                        edit = Some(i);
-                    }
-                });
-            });
+            if let Some(a) = object_row(ui, o, self.marking.is_none()) {
+                action = Some((i, a));
+            }
         }
-        if let Some(i) = focus {
-            let o = self.objects[i].clone();
-            self.focus_track(&o);
-        }
-        if let Some(i) = delete {
-            self.delete_object(i);
-        }
-        if let Some(i) = edit {
-            self.edit_object(i);
+        match action {
+            Some((i, RowAction::Focus)) => {
+                let o = self.objects[i].clone();
+                self.focus_track(&o);
+            }
+            Some((i, RowAction::Edit)) => self.edit_object(i),
+            Some((i, RowAction::Delete)) => self.delete_object(i),
+            None => {}
         }
         let undo = match &self.undo {
             Some(Undo::Object { object, .. }) => Some(format!("Deleted {}", object.label)),
@@ -773,48 +709,28 @@ impl App {
             self.apply_undo();
         }
 
-        let can_export = !self.objects.is_empty()
-            && self.marking.is_none()
-            && self.searches.record.is_some()
-            && self.export.is_none();
-        ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = S2;
-            let w = (ui.available_width() - S2) / 2.0;
-            let mark = ui
-                .add_enabled(
-                    self.marking.is_none(),
-                    Button::new("Mark object").min_size(vec2(w, theme::TOOL)),
+        if self.marking.is_none() {
+            // The accent goes to Review & copy report once there is
+            // something to report.
+            let primary = !self.objects.iter().any(|o| o.marked() >= 2);
+            let w = ui.available_width();
+            let button = if primary {
+                Button::new(RichText::new("Mark object").color(p.accent_text))
+                    .fill(p.accent)
+                    .stroke(Stroke::NONE)
+            } else {
+                Button::new("Mark object")
+            };
+            if ui
+                .add(button.min_size(vec2(w, theme::TOOL)))
+                .on_hover_text(
+                    "Click a moving object on each frame (M), or just click it on the image",
                 )
-                .on_hover_text("Click a moving object on each frame (M)");
-            if mark.clicked() {
+                .clicked()
+            {
                 self.start_marking();
             }
-            ui.add_enabled_ui(can_export, |ui| {
-                ui.menu_button("Export…", |ui| {
-                    if ui
-                        .button("Report (.json)")
-                        .on_hover_text("Your search with each object's positions")
-                        .clicked()
-                    {
-                        ui.close();
-                        self.export_report(ui.ctx(), frame, false);
-                    }
-                    if ui
-                        .button("Report with cutouts (.json)")
-                        .on_hover_text(
-                            "Also small pictures of each object on every frame, as you \
-                             saw them, so your teacher can check without the images",
-                        )
-                        .clicked()
-                    {
-                        ui.close();
-                        self.export_report(ui.ctx(), frame, true);
-                    }
-                })
-                .response
-                .on_hover_text("Save the detailed report to send to your teacher");
-            });
-        });
+        }
         if self.export.is_some() {
             ui.horizontal(|ui| {
                 ui.add(egui::Spinner::new().size(13.0).color(p.muted));
@@ -828,15 +744,107 @@ impl App {
         }
     }
 
-    /// "Students' reports": import and show other students' objects.
-    pub(super) fn reviews_section(&mut self, ui: &mut egui::Ui, frame: &eframe::Frame) {
+    /// `Marking A · frame 2 of 4`, a one-line hint, and the way out.
+    fn marking_card(&mut self, ui: &mut egui::Ui, label: &str, done: usize) {
         let p = palette(ui);
-        if self.reviews.is_empty() {
-            muted_wrapped(
-                ui,
-                "Import a student's report of this set to see the objects they marked.",
-            );
+        let editing = self.editing.is_some();
+        Frame::new()
+            .fill(p.inset)
+            .corner_radius(theme::RADIUS)
+            .stroke(Stroke::new(1.0, p.tag))
+            .inner_margin(Margin::same(S2 as i8))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.spacing_mut().item_spacing.y = S1 + 2.0;
+                let (doing, hint, more) = if editing {
+                    (
+                        "Editing",
+                        "Click its new position.",
+                        "A click moves it on this frame and goes to the next. Marks you \
+                         don't change stay. ← → choose another frame.",
+                    )
+                } else {
+                    (
+                        "Marking",
+                        "Click it; clicks snap to a source.",
+                        "Clicks snap to the centre of a detected source nearby. ← → choose \
+                         another frame; Enter uses the predicted spot.",
+                    )
+                };
+                ui.add(
+                    Label::new(
+                        RichText::new(format!(
+                            "{doing} {label} · frame {} of {}",
+                            self.index + 1,
+                            self.frame_count()
+                        ))
+                        .color(p.text),
+                    )
+                    .truncate(),
+                );
+                ui.add(Label::new(RichText::new(hint).small().color(p.muted)).truncate())
+                    .on_hover_text(more);
+                ui.horizontal_wrapped(|ui| {
+                    ui.spacing_mut().item_spacing.x = S1;
+                    if ui
+                        .button("Not on this frame")
+                        .on_hover_text("Too faint, hidden or off the image here")
+                        .clicked()
+                    {
+                        self.skip_frame();
+                    }
+                    if editing {
+                        if ui
+                            .button("Cancel")
+                            .on_hover_text("Keep the marks as they were")
+                            .clicked()
+                        {
+                            self.cancel_edit();
+                        }
+                    } else if done < 2 && ui.button("Cancel").clicked() {
+                        self.finish_marking();
+                    }
+                });
+                let done_button = Button::new(RichText::new("Done").color(p.accent_text))
+                    .fill(p.accent)
+                    .stroke(Stroke::NONE)
+                    .min_size(vec2(ui.available_width(), theme::TOOL));
+                if ui
+                    .add_enabled(done >= 2, done_button)
+                    .on_hover_text("Finish this object (Esc)")
+                    .on_disabled_hover_text("Mark it on at least two frames")
+                    .clicked()
+                {
+                    self.finish_marking();
+                }
+            });
+    }
+
+    /// Whether the search can be exported now.
+    pub(super) fn can_export(&self) -> bool {
+        !self.objects.is_empty()
+            && self.marking.is_none()
+            && self.searches.record.is_some()
+            && self.export.is_none()
+    }
+
+    /// `◎+ Mark` in the toolbar, next to the blink controls.
+    pub(super) fn mark_button(&mut self, ui: &mut egui::Ui) {
+        let on = self.marking.is_some();
+        let response = icons::text_button(ui, Icon::Mark, "Mark", on).on_hover_text(if on {
+            "Marking: click the object on each frame (Esc when done)"
+        } else {
+            "Mark a moving object on each frame (M), or just click it on the image"
+        });
+        if response.clicked() && !on {
+            self.start_marking();
         }
+    }
+
+    /// Other searches of the open set, imported or from a shared folder,
+    /// shown over the images.
+    pub(super) fn reviews_section(&mut self, ui: &mut egui::Ui) {
+        let p = palette(ui);
         let mut focus = None;
         let mut remove = None;
         for (ri, r) in self.reviews.iter_mut().enumerate() {
@@ -915,13 +923,6 @@ impl App {
         if let Some(ri) = remove {
             self.reviews.remove(ri);
         }
-        if ui
-            .button("Import report…")
-            .on_hover_text("Open a report a student exported for this image set")
-            .clicked()
-        {
-            self.import_report(frame);
-        }
         if let Some(n) = &self.review_note {
             ui.add(Label::new(RichText::new(n).small().color(p.muted)).wrap());
         }
@@ -930,7 +931,12 @@ impl App {
     // ------------------------------------------------------------------
     // Files
 
-    fn export_report(&mut self, ctx: &egui::Context, frame: &eframe::Frame, cutouts: bool) {
+    pub(super) fn export_json(
+        &mut self,
+        ctx: &egui::Context,
+        frame: &eframe::Frame,
+        cutouts: bool,
+    ) {
         let Some(record) = &self.searches.record else {
             return;
         };
@@ -944,7 +950,7 @@ impl App {
             name += " with cutouts";
         }
         let Some(path) = rfd::FileDialog::new()
-            .set_title("Export detailed report")
+            .set_title("Export as JSON")
             .set_file_name(format!("{name}.json"))
             .add_filter("OpenCeres report", &["json"])
             .set_parent(frame)
@@ -1030,9 +1036,9 @@ impl App {
         }
     }
 
-    fn import_report(&mut self, frame: &eframe::Frame) {
+    pub(super) fn import_report(&mut self, frame: &eframe::Frame) {
         let Some(path) = rfd::FileDialog::new()
-            .set_title("Import a student's report")
+            .set_title("Import JSON")
             .add_filter("OpenCeres report", &["json"])
             .set_parent(frame)
             .pick_file()
@@ -1095,6 +1101,139 @@ impl App {
         }
         note
     }
+}
+
+/// What a click on an object's row asks for.
+enum RowAction {
+    Focus,
+    Edit,
+    Delete,
+}
+
+/// `A  0.52″/min toward SE   ●●○●  ✓` on one line; edit and delete
+/// buttons take the place of the dots while the row is hovered or one of
+/// them has the keyboard focus.
+fn object_row(ui: &mut egui::Ui, o: &Tagged, can_edit: bool) -> Option<RowAction> {
+    let p = palette(ui);
+    let (rect, row) = ui.allocate_exact_size(
+        vec2(ui.available_width(), theme::TOOL),
+        egui::Sense::click(),
+    );
+    let button = |k: usize| {
+        Rect::from_min_size(
+            pos2(rect.max.x - (2 - k) as f32 * theme::TOOL, rect.min.y),
+            vec2(theme::TOOL, theme::TOOL),
+        )
+    };
+    let id = ui.id().with(("object_row", &o.label));
+    let edit = ui.interact(
+        button(0),
+        id.with("edit"),
+        if can_edit {
+            egui::Sense::click()
+        } else {
+            egui::Sense::hover()
+        },
+    );
+    let delete = ui.interact(button(1), id.with("delete"), egui::Sense::click());
+    let tools = ui.rect_contains_pointer(rect) || edit.has_focus() || delete.has_focus();
+    let painter = ui.painter();
+    if tools || row.has_focus() {
+        painter.rect_filled(rect, theme::RADIUS, p.hover);
+    }
+    let inner = rect.shrink2(vec2(S1 + 2.0, 0.0));
+    let label =
+        painter.layout_no_wrap(o.label.clone(), FontId::new(13.0, theme::semibold()), p.tag);
+    let mid = rect.center().y;
+    painter.galley(
+        pos2(inner.min.x, mid - label.size().y / 2.0),
+        label.clone(),
+        p.tag,
+    );
+    let text_x = inner.min.x + label.size().x.max(10.0) + S2;
+
+    // Right side: frame dots and a check (all marks on sources) or a
+    // warning (some placed by hand), or the two buttons.
+    let n = o.at.len();
+    let dots_w = n as f32 * 8.0;
+    let right = if tools {
+        2.0 * theme::TOOL
+    } else {
+        dots_w + S1 + 14.0
+    };
+    if tools {
+        for (r, icon, enabled) in [(&edit, Icon::Edit, can_edit), (&delete, Icon::Trash, true)] {
+            if enabled && (r.hovered() || r.has_focus()) {
+                painter.rect_filled(r.rect.shrink(1.0), theme::RADIUS, p.inset);
+            }
+            let color = if enabled {
+                p.icon
+            } else {
+                p.muted.gamma_multiply(0.5)
+            };
+            icons::paint(painter, r.rect.shrink(5.0), icon, color);
+        }
+    } else {
+        let mut x = rect.max.x - S1 - 14.0 - S1 - dots_w;
+        for at in &o.at {
+            let c = pos2(x + 4.0, mid);
+            if at.is_some() {
+                painter.circle_filled(c, 3.0, p.muted);
+            } else {
+                painter.circle_stroke(c, 2.5, Stroke::new(1.0, p.muted));
+            }
+            x += 8.0;
+        }
+        let unsnapped = o.unsnapped.iter().any(|&u| u);
+        let (icon, color) = if unsnapped {
+            (Icon::Warning, p.warning)
+        } else {
+            (Icon::Check, p.success)
+        };
+        let r = Rect::from_center_size(pos2(rect.max.x - S1 - 7.0, mid), vec2(14.0, 14.0));
+        icons::paint(painter, r, icon, color);
+    }
+    let (detail, color) = match (&o.known, o.motion()) {
+        (Some(k), _) => (k.clone(), p.known),
+        (None, Some(m)) => (m, p.text),
+        (None, None) => (String::new(), p.muted),
+    };
+    let mut job = egui::text::LayoutJob::single_section(
+        detail,
+        egui::TextFormat::simple(FontId::proportional(12.0), color),
+    );
+    job.wrap =
+        egui::text::TextWrapping::truncate_at_width((rect.max.x - right - S1 - text_x).max(0.0));
+    let galley = painter.layout_job(job);
+    painter.galley(pos2(text_x, mid - galley.size().y / 2.0), galley, color);
+
+    let mut tip = o.summary();
+    if let Some(k) = &o.known {
+        tip += &format!("\nKnown object: {k}");
+    }
+    let marked = o.marked();
+    tip += &format!("\nMarked on {marked} of {n} frames");
+    if o.unsnapped.iter().any(|&u| u) {
+        tip += "\nSome marks are not on a detected source: check them (dashed rings)";
+    }
+    tip += "\nClick to show it";
+    if edit
+        .on_hover_text(if can_edit {
+            "Edit marks: move or remove them, frame by frame"
+        } else {
+            "Finish marking first"
+        })
+        .clicked()
+    {
+        return Some(RowAction::Edit);
+    }
+    if delete.on_hover_text("Delete this object").clicked() {
+        return Some(RowAction::Delete);
+    }
+    row.on_hover_cursor(egui::CursorIcon::PointingHand)
+        .on_hover_text(tip)
+        .clicked()
+        .then_some(RowAction::Focus)
 }
 
 /// Records that the report needs box `cell` for an object. Only a box this

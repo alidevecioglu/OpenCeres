@@ -1,6 +1,7 @@
-//! Minor-planet motion from osculating heliocentric elements: two-body
-//! (Keplerian) positions, and a numerical integration that adds the
-//! planets' attraction for accurate positions far from the elements' epoch.
+//! Minor-planet and comet motion from osculating heliocentric elements:
+//! two-body (Keplerian) positions for elliptic, parabolic and hyperbolic
+//! orbits, and a numerical integration that adds the planets' attraction for
+//! accurate positions far from the elements' epoch.
 
 use std::f64::consts::{PI, TAU};
 
@@ -70,6 +71,119 @@ impl Elements {
     /// Perihelion distance, au.
     pub fn perihelion_distance(&self) -> f64 {
         self.semimajor_axis * (1.0 - self.eccentricity)
+    }
+}
+
+/// Osculating elements in perihelion form, as the MPC gives them for comets:
+/// any eccentricity (elliptic, parabolic or hyperbolic). Angles in degrees,
+/// ecliptic and equinox J2000.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Conic {
+    /// Time of perihelion passage, JD (TT).
+    pub perihelion_time: f64,
+    /// Perihelion distance q, au.
+    pub perihelion_distance: f64,
+    pub eccentricity: f64,
+    pub perihelion: f64,
+    pub node: f64,
+    pub inclination: f64,
+}
+
+impl Conic {
+    /// Heliocentric position (au) and velocity (au/day), ecliptic J2000, at
+    /// `jd_tt`, from two-body motion about the Sun.
+    ///
+    /// Uses the universal variable χ (Danby, *Fundamentals of Celestial
+    /// Mechanics*, 2nd ed., §6.9; Vallado, *Fundamentals of Astrodynamics
+    /// and Applications*, Algorithm 8), started at perihelion where r = q and
+    /// r·v = 0. With α = 1/a = (1 − e)/q and z = αχ², Kepler's equation is
+    /// √μ·Δt = e·χ³·c₃(z) + q·χ: one formula for every conic, so orbits with
+    /// e near 1 need no special case. Its derivative in χ is r > 0, and it is
+    /// convex for χ ≥ 0 up to aphelion, so Newton's method started above the
+    /// root converges monotonically.
+    pub fn state(&self, jd_tt: f64) -> ([f64; 3], [f64; 3]) {
+        let q = self.perihelion_distance;
+        let e = self.eccentricity;
+        let alpha = (1.0 - e) / q;
+        let mut dt = jd_tt - self.perihelion_time;
+        // Bound for χ: q·χ ≤ √μ·|Δt| always; for ellipses also half an
+        // orbit (eccentric anomaly π), after reducing Δt to [−P/2, P/2].
+        let mut hi = f64::INFINITY;
+        if alpha > 0.0 {
+            let period = TAU / (GAUSS_K * alpha.powf(1.5));
+            dt -= period * (dt / period).round();
+            hi = PI / alpha.sqrt();
+        }
+        let target = GAUSS_K * dt.abs();
+        // Newton inside a shrinking bracket [lo, hi]; bisection whenever a
+        // step would leave it or sinh overflows far above the root.
+        let (mut lo, mut hi) = (0.0, hi.min(target / q));
+        let mut chi = hi;
+        for _ in 0..500 {
+            let (c2, c3) = stumpff(alpha * chi * chi);
+            let f = e * chi * chi * chi * c3 + q * chi - target;
+            let r = q + e * chi * chi * c2;
+            if f.is_finite() && f <= 0.0 {
+                lo = chi;
+            } else {
+                hi = chi;
+            }
+            let newton = chi - f / r;
+            let next = if f.is_finite() && r.is_finite() && newton >= lo && newton <= hi {
+                newton
+            } else {
+                0.5 * (lo + hi)
+            };
+            let done = (next - chi).abs() <= 1e-15 * next || hi - lo <= 1e-15 * hi;
+            chi = next;
+            if done {
+                break;
+            }
+        }
+        let chi = chi.copysign(dt);
+        let z = alpha * chi * chi;
+        let (c2, c3) = stumpff(z);
+        let r = q + e * chi * chi * c2;
+        // Lagrange coefficients from the perihelion state r₀ = (q, 0),
+        // v₀ = (0, v_p): x = f·q and y = g·v_p, with g = Δt − χ³c₃/√μ
+        // rewritten through Kepler's equation as q·χ·(1 − z·c₃)/√μ, which
+        // avoids a cancellation.
+        let vp = (GM_SUN * (1.0 + e) / q).sqrt();
+        let position = [
+            q - chi * chi * c2,
+            vp * q * chi * (1.0 - z * c3) / GAUSS_K,
+            0.0,
+        ];
+        let fdot = GAUSS_K / (r * q) * chi * (z * c3 - 1.0);
+        let gdot = 1.0 - chi * chi * c2 / r;
+        let velocity = [q * fdot, vp * gdot, 0.0];
+        let rotate = |v| to_ecliptic(v, self.perihelion, self.node, self.inclination);
+        (rotate(position), rotate(velocity))
+    }
+}
+
+/// Stumpff functions c₂(z) = (1 − cos √z)/z and c₃(z) = (√z − sin √z)/z^(3/2),
+/// continued to z < 0 with cosh and sinh. Near 0, where the closed forms
+/// lose digits, their power series c₂ = Σ (−z)^k/(2k+2)!, c₃ = Σ (−z)^k/(2k+3)!.
+fn stumpff(z: f64) -> (f64, f64) {
+    if z.abs() < 1.0 {
+        // 12 terms: the next ones are below 1e-20.
+        let (mut c2, mut c3) = (0.0, 0.0);
+        let (mut term2, mut term3) = (0.5, 1.0 / 6.0);
+        for k in 0..12 {
+            c2 += term2;
+            c3 += term3;
+            let k = k as f64;
+            term2 *= -z / ((2.0 * k + 3.0) * (2.0 * k + 4.0));
+            term3 *= -z / ((2.0 * k + 4.0) * (2.0 * k + 5.0));
+        }
+        (c2, c3)
+    } else if z > 0.0 {
+        let s = z.sqrt();
+        ((1.0 - s.cos()) / z, (s - s.sin()) / (z * s))
+    } else {
+        let s = (-z).sqrt();
+        ((s.cosh() - 1.0) / -z, (s.sinh() - s) / (-z * s))
     }
 }
 
@@ -173,6 +287,18 @@ pub struct State {
 }
 
 impl State {
+    /// A two-body state: the acceleration is the Sun's alone.
+    pub fn two_body((position, velocity): ([f64; 3], [f64; 3]), jd_tt: f64) -> State {
+        let d2: f64 = position.iter().map(|x| x * x).sum();
+        let s = -GM_SUN / (d2 * d2.sqrt());
+        State {
+            jd_tt,
+            position,
+            velocity,
+            acceleration: position.map(|x| s * x),
+        }
+    }
+
     /// Position at `jd_tt` near the state's epoch, by the second-order
     /// Taylor series. Intended for the light-time and motion offsets
     /// (≤ ~1 h): the neglected jerk term is < 1e-9 au there even for NEAs.
@@ -212,8 +338,14 @@ const STEP_TOLERANCE: f64 = 2e-12;
 /// extrapolation then adds one order). `None` if the integration fails,
 /// e.g. on a collision-like close approach.
 pub fn propagate(elements: &Elements, jd_tt: f64) -> Option<State> {
-    let mut jd = elements.epoch;
-    let mut y = elements.state(jd);
+    integrate(elements.state(elements.epoch), elements.epoch, jd_tt)
+}
+
+/// Integrates a heliocentric state (ecliptic J2000 position, au, and
+/// velocity, au/day, at `from`, TT) to `jd_tt` as [`propagate`] does.
+pub fn integrate(start: ([f64; 3], [f64; 3]), from: f64, jd_tt: f64) -> Option<State> {
+    let mut jd = from;
+    let mut y = start;
     let span = jd_tt - jd;
     let direction = if span >= 0.0 { 1.0 } else { -1.0 };
     let mut h = direction * span.abs().min(1.0);
@@ -346,6 +478,205 @@ mod tests {
             let fd = (p1[k] - p0[k]) / (2.0 * h);
             assert!((fd - v[k]).abs() < 1e-9, "{k}: {fd} vs {}", v[k]);
         }
+    }
+
+    /// A test orbit with perihelion at JD 0, so that times keep a
+    /// resolution far below a microsecond (near JD 2.46 million a double
+    /// resolves only 40 µs, which is 1e-11 au at comet speeds).
+    fn conic(e: f64, q: f64) -> Conic {
+        Conic {
+            perihelion_time: 0.0,
+            perihelion_distance: q,
+            eccentricity: e,
+            perihelion: 75.0,
+            node: 40.0,
+            inclination: 20.0,
+        }
+    }
+
+    fn distance(a: [f64; 3], b: [f64; 3]) -> f64 {
+        (0..3).map(|k| (a[k] - b[k]).powi(2)).sum::<f64>().sqrt()
+    }
+
+    #[test]
+    fn conic_matches_the_elliptic_elements() {
+        // The same ellipse from perihelion form and from mean-anomaly form
+        // (the asteroid path, checked against Meeus and JPL above), over
+        // several revolutions in both directions.
+        for &(e, q) in &[(0.0, 1.0), (0.1, 2.2), (0.5, 1.0), (0.9, 0.5), (0.99, 0.3)] {
+            let c = conic(e, q);
+            let a: f64 = q / (1.0 - e);
+            let n = (GAUSS_K / a.powf(1.5)).to_degrees();
+            let epoch = c.perihelion_time + 123.4;
+            let el = Elements {
+                epoch,
+                mean_anomaly: n * (epoch - c.perihelion_time),
+                perihelion: c.perihelion,
+                node: c.node,
+                inclination: c.inclination,
+                eccentricity: e,
+                mean_motion: n,
+                semimajor_axis: a,
+            };
+            let period = 360.0 / n;
+            for k in -12..=12 {
+                let t = c.perihelion_time + k as f64 * 0.37 * period + 0.3;
+                let (p, v) = c.state(t);
+                let (p0, v0) = el.state(t);
+                let scale = a.max(1.0);
+                assert!(
+                    distance(p, p0) < 1e-11 * scale,
+                    "e={e} k={k}: {:e}",
+                    distance(p, p0)
+                );
+                assert!(
+                    distance(v, v0) < 1e-11 * scale,
+                    "e={e} k={k}: {:e}",
+                    distance(v, v0)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn parabola_matches_barker() {
+        // Barker's equation (Meeus, Astronomical Algorithms, ch. 34):
+        // W = 3k/√2 · (t − T)/q^1.5, s³ + 3s − W = 0 solved in closed form,
+        // v = 2·atan s, r = q(1 + s²).
+        let q = 0.7;
+        let c = conic(1.0, q);
+        for dt in [
+            -3000.0, -400.0, -30.0, -1.0, -1e-3, 0.0, 0.5, 10.0, 90.0, 1000.0, 8000.0,
+        ] {
+            let w = 3.0 * GAUSS_K / 2f64.sqrt() * dt / q.powf(1.5);
+            let y = (w / 2.0 + (w * w / 4.0 + 1.0).sqrt()).cbrt();
+            let s = y - 1.0 / y;
+            let nu = 2.0 * s.atan();
+            let r = q * (1.0 + s * s);
+            let plane = [r * nu.cos(), r * nu.sin(), 0.0];
+            let expected = to_ecliptic(plane, c.perihelion, c.node, c.inclination);
+            let (p, _) = c.state(c.perihelion_time + dt);
+            // The closed form loses a few digits for large W (y − 1/y).
+            assert!(
+                distance(p, expected) < 1e-12 * r.max(1.0),
+                "dt={dt}: {:e}",
+                distance(p, expected)
+            );
+        }
+    }
+
+    #[test]
+    fn hyperbola_matches_hyperbolic_kepler() {
+        // e·sinh H − H = N with N = k·(t − T)/(−a)^1.5, solved by bisection
+        // here (independent of the solver under test); x = |a|(e − cosh H),
+        // y = |a|·√(e² − 1)·sinh H.
+        for &(e, q) in &[(1.0005, 1.3), (1.05, 2.0), (1.5, 0.8), (3.0, 1.0)] {
+            let c = conic(e, q);
+            let big_a = q / (e - 1.0);
+            for dt in [-2000.0, -100.0, -2.0, 0.0, 3.0, 50.0, 700.0, 5000.0] {
+                let n = GAUSS_K * dt / big_a.powf(1.5);
+                let (mut lo, mut hi) = (-60.0f64, 60.0f64);
+                for _ in 0..200 {
+                    let mid = 0.5 * (lo + hi);
+                    if e * mid.sinh() - mid < n {
+                        lo = mid;
+                    } else {
+                        hi = mid;
+                    }
+                }
+                let h = 0.5 * (lo + hi);
+                let plane = [
+                    big_a * (e - h.cosh()),
+                    big_a * (e * e - 1.0).sqrt() * h.sinh(),
+                    0.0,
+                ];
+                let expected = to_ecliptic(plane, c.perihelion, c.node, c.inclination);
+                let (p, _) = c.state(c.perihelion_time + dt);
+                let r = distance(expected, [0.0; 3]);
+                assert!(
+                    distance(p, expected) < 1e-11 * r.max(1.0),
+                    "e={e} dt={dt}: {:e}",
+                    distance(p, expected)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn conic_is_continuous_and_consistent_through_e_1() {
+        // Energy v²/2 − μ/r = −μ(1 − e)/(2q) and angular momentum
+        // |r × v| = √(μq(1 + e)) hold everywhere; velocity is the
+        // derivative of position; and e just below, at and just above 1
+        // give nearly the same path.
+        let times = [-900.0, -60.0, -0.5, 0.0, 0.25, 7.0, 365.0, 2500.0];
+        for &e in &[0.999_999, 0.9999999999, 1.0, 1.0000000001, 1.000_001] {
+            let c = conic(e, 0.4);
+            for dt in times {
+                let t = c.perihelion_time + dt;
+                let (p, v) = c.state(t);
+                let r = distance(p, [0.0; 3]);
+                let v2: f64 = v.iter().map(|x| x * x).sum();
+                let energy = v2 / 2.0 - GM_SUN / r;
+                let expected = -GM_SUN * (1.0 - e) / (2.0 * 0.4);
+                assert!(
+                    (energy - expected).abs() < 1e-14,
+                    "e={e} dt={dt}: {energy:e} vs {expected:e}"
+                );
+                let h = [
+                    p[1] * v[2] - p[2] * v[1],
+                    p[2] * v[0] - p[0] * v[2],
+                    p[0] * v[1] - p[1] * v[0],
+                ];
+                let h_expected = (GM_SUN * 0.4 * (1.0 + e)).sqrt();
+                assert!((distance(h, [0.0; 3]) - h_expected).abs() < 1e-13);
+                let step = 1e-3;
+                let (p1, p0) = (c.state(t + step).0, c.state(t - step).0);
+                for k in 0..3 {
+                    let fd = (p1[k] - p0[k]) / (2.0 * step);
+                    assert!((fd - v[k]).abs() < 1e-9, "e={e} dt={dt}: {fd} vs {}", v[k]);
+                }
+                let parabola = conic(1.0, 0.4).state(t).0;
+                assert!(distance(p, parabola) < 1e-4 * r.max(1.0), "e={e} dt={dt}");
+            }
+        }
+    }
+
+    #[test]
+    fn integrate_starts_from_any_state() {
+        // A comet-like ellipse integrated from its perihelion-form state is
+        // the asteroid path's integration of the same orbit.
+        let c = Conic {
+            perihelion_time: 2_461_000.5,
+            ..conic(0.6, 1.1)
+        };
+        let a: f64 = 1.1 / 0.4;
+        let n = (GAUSS_K / a.powf(1.5)).to_degrees();
+        let epoch = c.perihelion_time + 40.0;
+        let el = Elements {
+            epoch,
+            mean_anomaly: n * 40.0,
+            perihelion: c.perihelion,
+            node: c.node,
+            inclination: c.inclination,
+            eccentricity: 0.6,
+            mean_motion: n,
+            semimajor_axis: a,
+        };
+        let t = epoch + 200.0;
+        let ours = integrate(c.state(epoch), epoch, t).unwrap();
+        let theirs = propagate(&el, t).unwrap();
+        assert!(
+            distance(ours.position, theirs.position) < 1e-10,
+            "{:e}",
+            distance(ours.position, theirs.position)
+        );
+        // Perturbations are included: the planets move it off the conic.
+        assert!(distance(ours.position, c.state(t).0) > 1e-7);
+        // The two-body state's acceleration is the Sun's pull alone.
+        let s = State::two_body(c.state(t), t);
+        let r = distance(s.position, [0.0; 3]);
+        let g = distance(s.acceleration, [0.0; 3]);
+        assert!((g - GM_SUN / (r * r)).abs() < 1e-18);
     }
 
     #[test]

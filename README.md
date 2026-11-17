@@ -5,7 +5,7 @@
 # OpenCeres
 
 **A small, fast, open-source app for asteroid searching.**
-Blink your survey images, spot what moves, check known asteroids and send the report.
+Blink your survey images, spot what moves, check known asteroids and comets, and copy an MPC report.
 
 [![Latest release](https://img.shields.io/github/v/release/alidevecioglu/OpenCeres?label=download&color=f5b335)](https://github.com/alidevecioglu/OpenCeres/releases/latest)
 [![Build](https://github.com/alidevecioglu/OpenCeres/actions/workflows/build.yml/badge.svg)](https://github.com/alidevecioglu/OpenCeres/actions/workflows/build.yml)
@@ -16,7 +16,7 @@ Blink your survey images, spot what moves, check known asteroids and send the re
 [Releases](https://github.com/alidevecioglu/OpenCeres/releases) ·
 [Report a problem](https://github.com/alidevecioglu/OpenCeres/issues)
 
-<img src="docs/assets/screenshot-known.jpg" alt="OpenCeres showing a Pan-STARRS image with two known asteroids circled" width="860">
+<img src="docs/assets/screenshot-known.jpg" alt="OpenCeres showing a Pan-STARRS image with two marked moving objects, both matched to known asteroids, and the report ready in the side panel" width="860">
 
 </div>
 
@@ -28,38 +28,52 @@ discover new asteroids and report them to the
 It is named after Ceres, the first asteroid ever found (Piazzi, 1801).
 
 > [!NOTE]
-> **Early development.** Viewing, blinking, known objects and box reports work
-> today. The image-processing core is tested on real Pan-STARRS images (FITS
-> reading, star detection, sky coordinates, MPC report lines). Plate solving
-> against Gaia, automatic moving-object detection and full MPC reports are in
-> progress, so keep using your current software for official campaign
-> measurements for now.
+> **In trial.** Blinking, known objects and comets, and full MPC reports with
+> positions measured against Gaia DR3 work today. On real IASC Pan-STARRS
+> images the plate solutions fit to 0.02–0.03″ and known asteroids land within
+> 0.15″ of their predicted places. Campaigns have not yet confirmed that
+> they accept the reports, so run OpenCeres alongside your current software
+> until they do. Automatic moving-object detection is not built yet.
 
 ## Features
 
 - **Blink** — open a folder of FITS images or the `.zip` you were sent; frames
-  load in parallel and blink at any speed, with stretch, invert and zoom.
-- **Known objects** — asteroids already in the field are circled with their
-  name, magnitude and motion, looked up online with
-  [SkyBoT](https://ssp.imcce.fr/webservices/skybot/) or offline from MPCORB.
-- **Easy report** — turn on the grid (3×3 to 8×8), click every box where
-  something moves and copy a ready-to-send report such as `XY57_p01: 2x3`.
-  Boxes are named row × column from the top-left, like the team charts.
-- **Search history** — every search is saved as you work: who searched,
-  the marked boxes, notes and its status as it moves through IASC's steps
-  (reported → preliminary detection → provisional designation → numbered).
-  Reopen a set to continue where you left off. Point the history at a
-  shared folder (OneDrive, Google Drive, a network drive) to collect a whole
-  class's searches, or export them for a teacher as JSON or a spreadsheet.
+  load in parallel and blink at any speed from 0.1 to 5 s per frame (drag,
+  scroll, presets or keys), with stretch, invert, zoom and alignment on the
+  stars.
+- **Mark what moves** — click a moving object on each frame; marks snap to
+  the detected source and the next position is predicted for you.
+- **Known objects and comets** — asteroids and comets already in the field are
+  circled with their name, magnitude and motion, from the MPC's MPCORB and
+  comet catalogues on your own computer (works offline) or online with
+  [SkyBoT](https://ssp.imcce.fr/webservices/skybot/).
+- **MPC report** — every mark is measured against Gaia DR3 stars in the same
+  frame: plate solution, centroid, magnitude and uncertainty. Review the
+  report, then **Copy report** and paste it into your campaign's report box.
+  The MPC header comes from your team details; Save as `.txt` or as ADES PSV.
+  Positions taken only from the image header are never offered for copying.
+  Gaia stars come from VizieR, trying its mirrors in turn, and are kept for
+  offline use.
+- **Search history** — every search is saved as you work: who measured it,
+  the marked objects, notes and its status as it moves through the campaign's
+  steps (reported → preliminary detection → provisional designation →
+  numbered). Reopen a set to continue where you left off. Point the history at
+  a shared folder (OneDrive, Google Drive, a network drive) to collect a whole
+  team's searches, or export and import them as JSON.
+- **Welcome and languages** — a short welcome on first launch sets the
+  language, theme, team details and catalogue. The interface is ready for
+  translation: see [TRANSLATING.md](TRANSLATING.md) to add your language.
+- **Box report (optional)** — the older grid report (click the boxes where
+  something moves) is still there under Settings → Features.
 - **Tiny and fast** — native Rust with no web engine: about 5 MB, starts
   instantly and uses ~0 % CPU when idle. The core library has no third-party
   dependencies.
-- **Everywhere** — Apple Silicon and Intel Macs, Windows and Linux. No Wine,
-  no emulators.
-- **Keeps itself current** — checks for new versions and shows what's new.
+- **Everywhere** — Apple Silicon and Intel Macs (with a native menu bar),
+  Windows and Linux. No Wine, no emulators.
+- **Keeps itself current** — checks for new versions and catalogue updates.
 
 <p align="center">
-  <img src="docs/assets/screenshot-report.jpg" alt="The 4×4 report grid with box 2x3 selected" width="720">
+  <img src="docs/assets/screenshot-report.jpg" alt="The MPC report window: Gaia fits for each frame, the objects with their checks, and the 80-column report ready to copy" width="720">
 </p>
 
 ## Download
@@ -74,7 +88,7 @@ or the [releases page](https://github.com/alidevecioglu/OpenCeres/releases/lates
 | Linux (x86_64) | `OpenCeres-<version>-linux-x86_64.tar.gz` | Extract and run `./openceres-desktop` (needs OpenGL). |
 
 Each download also contains `openceres`, a command-line tool for inspecting
-FITS files and listing detected stars.
+FITS files, listing detected stars and plate-solving a frame against Gaia.
 
 ## Goals
 
@@ -88,9 +102,11 @@ FITS files and listing detected stars.
 ## Layout
 
 ```
-crates/core     openceres-core: FITS, detection, WCS, time, MPC formatting (no dependencies)
+crates/core     openceres-core: FITS, detection, WCS, plate solving against Gaia,
+                photometry, orbits and ephemerides, MPC and ADES formats (no dependencies)
 crates/cli      openceres: command-line tool for checking the core on real data
-crates/desktop  OpenCeres desktop app: egui (pure Rust, OpenGL), no web engine
+crates/desktop  OpenCeres desktop app: egui (pure Rust, OpenGL), no web engine;
+                interface texts in crates/desktop/locales/
 docs/           download page (GitHub Pages)
 ```
 
@@ -111,6 +127,7 @@ Command-line tool:
 ```sh
 ./dev cargo run --release -p openceres-cli -- info  path/to/image.fits
 ./dev cargo run --release -p openceres-cli -- stars path/to/image.fits --limit 20
+./dev cargo run --release -p openceres-cli -- solve path/to/image.fits
 ```
 
 macOS app (built on the Mac itself, since Docker can't build macOS apps; needs
@@ -136,7 +153,9 @@ it loads, so it never needs editing for a new version.
 
 ## Contributing
 
-Issues and pull requests are welcome. Please run `./dev check` before opening a
+Issues and pull requests are welcome. Translations are especially welcome:
+[TRANSLATING.md](TRANSLATING.md) explains how to add a language without
+writing any Rust. Please run `./dev check` before opening a
 pull request, and include tests for new behaviour — ideally against synthetic
 images with known answers.
 

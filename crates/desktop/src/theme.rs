@@ -56,9 +56,7 @@ pub struct Palette {
     pub inset: Color32,
     pub danger_bg: Color32,
     pub danger: Color32,
-    #[allow(dead_code)] // part of the palette; no status text uses it yet
     pub success: Color32,
-    #[allow(dead_code)]
     pub warning: Color32,
     /// The student's own objects and known objects, as text in the side
     /// panel (the overlay colours are chosen for the image, not the panel).
